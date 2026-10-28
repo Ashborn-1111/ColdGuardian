@@ -23,10 +23,9 @@ def on_subscribe(client, userdata, mid, reason_code_list, properties):
 
 def on_message(client, userdata, msg):
     print(f"Topic: {msg.topic}")
-    print(f"Payload: {msg.payload.decode('utf-8', errors='replace')}")
+    print(f"Data: {msg.payload.decode('utf-8', errors='replace')}")
 
-
-
+    
 client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     client_id="coldchain_user"
@@ -42,5 +41,9 @@ print(f"Connecting to {MQTT_HOST}:{MQTT_PORT}...")
 
 client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
 client.loop_forever()
+
+
+
+
 
 
