@@ -6,7 +6,9 @@ device-reported events create alerts.
 """
 
 import argparse
+import base64
 import getpass
+from io import BytesIO
 import hashlib
 import hmac
 import json
@@ -56,6 +58,8 @@ API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+# Keep this stable across backend restarts. Generate with: python -c 'import secrets; print(secrets.token_hex(32))'
+TRACKING_TOKEN_SECRET = os.getenv("TRACKING_TOKEN_SECRET", "").strip()
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 ACTIVATION_BASE_URL = os.getenv(
     "ACTIVATION_BASE_URL", f"{FRONTEND_BASE_URL}/activate"
@@ -160,6 +164,41 @@ def verify_password(password_hash: str, password: str) -> bool:
 
 def session_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def tracking_secret_configured() -> bool:
+    return len(TRACKING_TOKEN_SECRET.encode("utf-8")) >= 32
+
+
+def require_tracking_secret() -> None:
+    if not tracking_secret_configured():
+        api_error(
+            503,
+            "TRACKING_TOKEN_SECRET_NOT_CONFIGURED",
+            "Set TRACKING_TOKEN_SECRET in the backend .env to a stable random value of at least 32 characters.",
+        )
+
+
+def tracking_token_for(package_id: str, version: int) -> str:
+    """Derive a stable bearer token without storing its plaintext in PostgreSQL.
+
+    The secret must remain stable. Rotating tracking_token_version revokes the
+    previous URL while keeping only the token hash in the database.
+    """
+    if not tracking_secret_configured():
+        raise RuntimeError("TRACKING_TOKEN_SECRET must contain at least 32 characters")
+    message = f"coldguardian-tracking-v1:{package_id}:{version}".encode("utf-8")
+    digest = hmac.new(
+        TRACKING_TOKEN_SECRET.encode("utf-8"), message, hashlib.sha256
+    ).digest()[:24]  # 192-bit bearer token, URL-safe without padding.
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def tracking_url_for(package_id: str, version: int) -> str | None:
+    if version < 1 or not tracking_secret_configured():
+        return None  # Version 0 identifies legacy random tokens that cannot be recovered.
+    token = tracking_token_for(package_id, version)
+    return f"{PUBLIC_BASE_URL}/track/{quote(token, safe='')}"
 
 
 def csrf_token_for_session(session_token: str) -> str:
@@ -415,12 +454,17 @@ CREATE TABLE IF NOT EXISTS packages (
     shipment_id TEXT REFERENCES shipments(shipment_id),
     status TEXT NOT NULL DEFAULT 'packed' CHECK (status IN ('packed', 'in_transit', 'delivered')),
     tracking_token_hash TEXT NOT NULL UNIQUE,
+    tracking_token_version INTEGER NOT NULL DEFAULT 0 CHECK (tracking_token_version >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     dispatched_at TIMESTAMPTZ,
     delivered_at TIMESTAMPTZ,
     CHECK (min_temperature_c <= max_temperature_c)
 );
+
+-- Additive migration: old packages use version 0 until their tracking token is rotated.
+ALTER TABLE packages ADD COLUMN IF NOT EXISTS tracking_token_version INTEGER NOT NULL DEFAULT 0
+    CHECK (tracking_token_version >= 0);
 
 CREATE TABLE IF NOT EXISTS telemetry (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -816,6 +860,7 @@ def current_assignment(conn, device_id: str):
         """
         SELECT p.package_id, p.shipment_id, p.product_sku, p.product_name,
                p.min_temperature_c, p.max_temperature_c, p.shock_threshold_g,
+               p.tracking_token_version,
                p.status AS package_status, s.status AS shipment_status
         FROM packages p
         LEFT JOIN shipments s ON s.shipment_id = p.shipment_id
@@ -935,12 +980,23 @@ def publish_device_config(client: mqtt.Client, device_id: str) -> None:
         }
         shock_config = {"threshold_g": assignment["shock_threshold_g"]}
 
+    tracking_url = (
+        tracking_url_for(assignment["package_id"], assignment["tracking_token_version"])
+        if assigned else None
+    )
+    if assigned and assignment["tracking_token_version"] > 0 and tracking_url is None:
+        logger.error(
+            "TRACKING_TOKEN_SECRET is missing/too short; config for %s will omit tracking_url",
+            device_id,
+        )
+
     config = {
         "schema_version": 1,
         "message_type": "device_config",
         "device_id": device_id,
         "config_version": device["config_version"],
         "issued_at": utc_iso(),
+        "tracking_url": tracking_url,
         "assignment": {
             "assigned": assigned,
             "package_id": assignment["package_id"] if assigned else None,
@@ -1847,8 +1903,7 @@ def readyz():
 
 @router.post("/packages", status_code=201)
 def create_package(body: PackageCreate, actor: str = Depends(require_operator)):
-    token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    require_tracking_secret()
     year = datetime.now(timezone.utc).year
     device_ids: list[str] = []
     with connect_db() as conn:
@@ -1861,13 +1916,16 @@ def create_package(body: PackageCreate, actor: str = Depends(require_operator)):
                 api_error(409, "DEVICE_ALREADY_ASSIGNED", "The tracker is already assigned to another package.")
         sequence = conn.execute("SELECT nextval('package_id_seq') AS value").fetchone()["value"]
         package_id = f"PKG-{year}-{sequence:04d}"
+        tracking_token_version = 1
+        token = tracking_token_for(package_id, tracking_token_version)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         row = conn.execute(
             """
             INSERT INTO packages (
                 package_id, product_sku, product_name, quantity, unit, batch_number,
                 expiry_date, min_temperature_c, max_temperature_c, shock_threshold_g,
-                device_id, status, tracking_token_hash
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'packed', %s)
+                device_id, status, tracking_token_hash, tracking_token_version
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'packed', %s, %s)
             RETURNING package_id, product_sku, product_name, quantity, unit, batch_number,
                       expiry_date, min_temperature_c, max_temperature_c, shock_threshold_g,
                       device_id, shipment_id, status, created_at, updated_at
@@ -1875,14 +1933,13 @@ def create_package(body: PackageCreate, actor: str = Depends(require_operator)):
             (
                 package_id, body.product_sku, body.product_name, body.quantity, body.unit,
                 body.batch_number, body.expiry_date, body.min_temperature_c, body.max_temperature_c,
-                body.shock_threshold_g, body.device_id, token_hash,
+                body.shock_threshold_g, body.device_id, token_hash, tracking_token_version,
             ),
         ).fetchone()
         if body.device_id:
             device_ids = bump_config_versions(conn, [body.device_id])
     publish_configs(device_ids)
     return {"package": row, "tracking_url": f"{PUBLIC_BASE_URL}/track/{quote(token, safe='')}"}
-
 
 @router.get("/packages")
 def list_packages(
@@ -2003,31 +2060,116 @@ def update_package(package_id: str, body: PackageUpdate, actor: str = Depends(re
     return row
 
 
-@router.post("/packages/{package_id}/tracking-token/rotate")
-def rotate_tracking_token(package_id: str, admin: dict[str, Any] = Depends(require_admin)):
-    raw_token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+@router.get("/packages/{package_id}/tracking-token")
+def get_tracking_token_url(package_id: str, admin: dict[str, Any] = Depends(require_admin)):
+    """Return the current URL to an administrator without rotating a valid token."""
+    require_tracking_secret()
     with connect_db() as conn:
         package = conn.execute(
-            "SELECT package_id FROM packages WHERE package_id = %s FOR UPDATE",
+            "SELECT package_id, tracking_token_version FROM packages WHERE package_id = %s",
+            (package_id,),
+        ).fetchone()
+    if package is None:
+        api_error(404, "PACKAGE_NOT_FOUND", "Package not found.")
+    version = package["tracking_token_version"]
+    url = tracking_url_for(package_id, version)
+    return {
+        "package_id": package_id,
+        "tracking_token_version": version,
+        "tracking_url": url,
+        "needs_rotation": url is None,
+    }
+
+
+@router.get("/packages/{package_id}/tracking-qr.png")
+def get_tracking_qr_png(package_id: str, admin: dict[str, Any] = Depends(require_admin)):
+    """Generate a PNG QR code for the package's current public tracking URL.
+
+    The QR image itself is generated by the backend on demand. The ESP32 does
+    not download this PNG; it receives the same tracking URL over retained MQTT
+    configuration and draws the QR matrix locally on its OLED.
+    """
+    require_tracking_secret()
+    with connect_db() as conn:
+        package = conn.execute(
+            "SELECT package_id, tracking_token_version FROM packages WHERE package_id = %s",
+            (package_id,),
+        ).fetchone()
+    if package is None:
+        api_error(404, "PACKAGE_NOT_FOUND", "Package not found.")
+
+    tracking_url = tracking_url_for(package_id, package["tracking_token_version"])
+    if tracking_url is None:
+        api_error(
+            409,
+            "TRACKING_TOKEN_ROTATION_REQUIRED",
+            "This package has a legacy tracking token. Rotate it before generating a QR code.",
+        )
+
+    try:
+        import qrcode
+        from qrcode.constants import ERROR_CORRECT_M
+    except ImportError:
+        api_error(503, "QR_LIBRARY_UNAVAILABLE", "Install the backend dependency qrcode[pil].")
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=ERROR_CORRECT_M,
+        box_size=8,
+        border=4,
+    )
+    qr.add_data(tracking_url)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    safe_package_id = re.sub(r"[^A-Za-z0-9_-]", "_", package_id)
+    return Response(
+        content=output.getvalue(),
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": f'attachment; filename="{safe_package_id}_tracking_qr.png"',
+        },
+    )
+
+
+@router.post("/packages/{package_id}/tracking-token/rotate")
+def rotate_tracking_token(package_id: str, admin: dict[str, Any] = Depends(require_admin)):
+    require_tracking_secret()
+    device_ids: list[str] = []
+    with connect_db() as conn:
+        package = conn.execute(
+            "SELECT package_id, device_id, tracking_token_version FROM packages WHERE package_id = %s FOR UPDATE",
             (package_id,),
         ).fetchone()
         if package is None:
             api_error(404, "PACKAGE_NOT_FOUND", "Package not found.")
+        # Legacy version 0 had a random token whose plaintext was deliberately
+        # discarded. Rotation upgrades it to deterministic version 1.
+        token_version = package["tracking_token_version"] + 1
+        raw_token = tracking_token_for(package_id, token_version)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
         conn.execute(
-            "UPDATE packages SET tracking_token_hash = %s, updated_at = NOW() WHERE package_id = %s",
-            (token_hash, package_id),
+            """UPDATE packages
+               SET tracking_token_hash = %s, tracking_token_version = %s, updated_at = NOW()
+               WHERE package_id = %s""",
+            (token_hash, token_version, package_id),
         )
+        device_ids = bump_config_versions(conn, [package["device_id"]])
         record_audit(
             conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
             action="tracking_token_rotated", target_type="package", target_id=package_id,
-            metadata={},
+            metadata={"tracking_token_version": token_version},
         )
+    publish_configs(device_ids)
     return {
         "package_id": package_id,
         "tracking_url": f"{PUBLIC_BASE_URL}/track/{quote(raw_token, safe='')}",
+        "tracking_token_version": token_version,
+        "config_republished_to_device": bool(device_ids),
     }
-
 
 @router.get("/packages/{package_id}/telemetry")
 def package_telemetry(
