@@ -36,7 +36,7 @@ def on_message(client, userdata, msg):
         print("Invalid JSON; ACK not sent")
         return
     #step:3 Handle registration messages only
-    if payload_json.get("type") !="register":
+    if payload_json.get("message_type") != "register":
         return
      # Step 4: Extract device ID from the topic
     topic_parts = msg.topic.split("/")
@@ -48,7 +48,7 @@ def on_message(client, userdata, msg):
     ack_topic = f"coldchain/{device_id}/registration/ack"
 
     # Step 5: Get and validate required settings
-    settings = payload_json.get("settings", {})
+    settings = payload_json.get("payload", {}).get("settings", {})
 
     required_settings = [
         "max_temperature_c",
