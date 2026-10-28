@@ -3,12 +3,12 @@ import os
 import paho.mqtt.client as mqtt
 
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.getenv("PORT", 1883))
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "coldchain/+/messages")
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 
-def on_connect(client, userdata, reason_code, properties):
+def on_connect(client, userdata,flags,reason_code,properties):
     if reason_code == 0:
         print("Connected to MQTT broker")
 
