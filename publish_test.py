@@ -16,13 +16,8 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.getenv("TEST_MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("TEST_MQTT_PASSWORD") or None
 
-DEVICE_ID = os.getenv("DEVICE_ID", "tracker-001")
+DEVICE_ID = os.getenv("DEVICE_ID", "tracker-test-001")
 
-if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", DEVICE_ID):
-    raise ValueError(
-        "DEVICE_ID must contain only letters, numbers, underscores "
-        "or hyphens and be at most 64 characters"
-    )
 
 MESSAGE_TOPIC = f"coldchain/{DEVICE_ID}/messages"
 ACK_TOPIC = f"coldchain/{DEVICE_ID}/registration/ack"
@@ -31,6 +26,7 @@ CONFIG_TOPIC = f"coldchain/{DEVICE_ID}/config"
 BOOT_ID = uuid.uuid4().hex[:8]
 
 INITIAL_DEVICE_SETTINGS = {
+    "min_temperature_c": 2.0,
     "max_temperature_c": 8.0,
     "shock_threshold_g": 4.0,
 }
