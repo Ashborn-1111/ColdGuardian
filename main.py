@@ -1,24 +1,40 @@
+"""Cold-chain monitoring backend for the MVP contract in the project specification.
+
+Thresholds are owned by packages. Devices receive them through retained MQTT
+configuration messages; telemetry is stored as observations and only explicit
+device-reported events create alerts.
+"""
+
+import argparse
+import getpass
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
 import secrets
+import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from hmac import compare_digest
 from typing import Any, Literal
 from urllib.parse import quote
 
 import paho.mqtt.client as mqtt
 import psycopg
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import APIKeyCookie
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 import uvicorn
 
 
@@ -40,7 +56,39 @@ API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-COLDCHAIN_ADMIN_TOKEN = os.getenv("COLDCHAIN_ADMIN_TOKEN") or None
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
+ACTIVATION_BASE_URL = os.getenv(
+    "ACTIVATION_BASE_URL", f"{FRONTEND_BASE_URL}/activate"
+).rstrip("/")
+SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "coldchain_session")
+session_cookie_scheme = APIKeyCookie(name=SESSION_COOKIE_NAME, auto_error=False)
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+SESSION_IDLE_TIMEOUT_SECONDS = int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", str(12 * 60 * 60)))
+COOKIE_SECURE = os.getenv(
+    "COOKIE_SECURE", "true" if PUBLIC_BASE_URL.startswith("https://") else "false"
+).lower() in {"1", "true", "yes", "on"}
+COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "lax").lower()
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN") or None
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if origin.strip()
+]
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "900"))
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "10"))
+INVITATION_TTL_HOURS = int(os.getenv("INVITATION_TTL_HOURS", "24"))
+PASSWORD_MIN_LENGTH = 12
+
+if COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+    raise RuntimeError("COOKIE_SAMESITE must be lax, strict, or none")
+if COOKIE_SAMESITE == "none" and not COOKIE_SECURE:
+    raise RuntimeError("COOKIE_SAMESITE=none requires COOKIE_SECURE=true")
+if SESSION_TTL_SECONDS < 300 or SESSION_IDLE_TIMEOUT_SECONDS < 60:
+    raise RuntimeError("Session TTL must be at least 300 seconds and idle timeout at least 60 seconds")
+if LOGIN_WINDOW_SECONDS < 60 or LOGIN_MAX_ATTEMPTS < 1 or INVITATION_TTL_HOURS < 1:
+    raise RuntimeError("Login rate-limit and invitation expiry settings must be positive")
 
 # The MVP uses a 15-second reporting interval. Temperature/shock thresholds
 # are never defaulted here; they come from the package record.
@@ -60,33 +108,216 @@ logger = logging.getLogger("coldchain")
 mqtt_client: mqtt.Client | None = None
 mqtt_connected = False
 mqtt_subscribed = False
-bearer_scheme = HTTPBearer(auto_error=False)
+schema_ready = False
+password_hasher = PasswordHasher()
+_DUMMY_PASSWORD_HASH: str | None = None
+LOGIN_FAILURES: dict[str, list[float]] = {}
+LOGIN_FAILURES_LOCK = threading.Lock()
 
 
 def connect_db():
-    """Open a PostgreSQL connection; the database must already exist."""
+    """Open a PostgreSQL connection; the database itself must already exist."""
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
-def api_error(status_code: int, code: str, message: str) -> None:
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> None:
     raise HTTPException(
         status_code=status_code,
         detail={"code": code, "message": message},
+        headers=headers,
     )
 
 
-def require_admin(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-) -> str:
-    """Shared-token authentication for all operator/dashboard endpoints."""
-    if not COLDCHAIN_ADMIN_TOKEN:
-        api_error(503, "ADMIN_AUTH_NOT_CONFIGURED", "Set COLDCHAIN_ADMIN_TOKEN before using admin endpoints.")
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        api_error(401, "AUTHENTICATION_REQUIRED", "Provide an Authorization: Bearer token.")
-    if not compare_digest(credentials.credentials, COLDCHAIN_ADMIN_TOKEN):
-        api_error(401, "INVALID_TOKEN", "The bearer token is invalid.")
-    # A shared demo token does not identify an individual operator.
-    return "admin"
+def normalize_email(value: str) -> str:
+    value = value.strip().lower()
+    if len(value) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+        raise ValueError("A valid email address is required")
+    return value
+
+
+def password_is_valid(value: str) -> bool:
+    return isinstance(value, str) and PASSWORD_MIN_LENGTH <= len(value) <= 128
+
+
+def hash_password(password: str) -> str:
+    if not password_is_valid(password):
+        raise ValueError(f"Password must be {PASSWORD_MIN_LENGTH}-128 characters long")
+    return password_hasher.hash(password)
+
+
+def verify_password(password_hash: str, password: str) -> bool:
+    try:
+        return password_hasher.verify(password_hash, password)
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
+
+
+def session_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def csrf_token_for_session(session_token: str) -> str:
+    # A session-bound synchronizer token; the session cookie itself is HttpOnly.
+    return hmac.new(
+        session_token.encode("utf-8"), b"coldchain-csrf-v1", hashlib.sha256
+    ).hexdigest()
+
+
+def set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        path="/",
+        domain=COOKIE_DOMAIN,
+    )
+
+
+def clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+        domain=COOKIE_DOMAIN,
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+    )
+
+
+def expired_session_cookie_header() -> str | None:
+    temporary_response = Response()
+    clear_session_cookie(temporary_response)
+    return temporary_response.headers.get("set-cookie")
+
+
+def _login_attempt_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def login_rate_limited(key: str) -> bool:
+    now = time.monotonic()
+    with LOGIN_FAILURES_LOCK:
+        recent = [stamp for stamp in LOGIN_FAILURES.get(key, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+        LOGIN_FAILURES[key] = recent
+        return len(recent) >= LOGIN_MAX_ATTEMPTS
+
+
+def record_login_failure(key: str) -> None:
+    now = time.monotonic()
+    with LOGIN_FAILURES_LOCK:
+        recent = [stamp for stamp in LOGIN_FAILURES.get(key, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+        recent.append(now)
+        LOGIN_FAILURES[key] = recent
+
+
+def clear_login_failures(key: str) -> None:
+    with LOGIN_FAILURES_LOCK:
+        LOGIN_FAILURES.pop(key, None)
+
+
+def get_current_user(
+    request: Request,
+    raw_token: str | None = Depends(session_cookie_scheme),
+) -> dict[str, Any]:
+    """Authenticate an opaque server-side session and enforce CSRF on mutations."""
+    if not raw_token:
+        api_error(401, "AUTHENTICATION_REQUIRED", "Log in to access this endpoint.")
+
+    token_hash = session_token_hash(raw_token)
+    now = datetime.now(timezone.utc)
+    invalid_session = False
+    csrf_invalid = False
+    user: dict[str, Any] | None = None
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT s.session_id, s.user_id, s.last_seen_at, s.expires_at, s.revoked_at,
+                   u.email, u.role, u.is_active, u.created_at, u.last_login_at
+            FROM user_sessions s JOIN users u ON u.user_id = s.user_id
+            WHERE s.token_hash = %s
+            """,
+            (token_hash,),
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None or not row["is_active"]:
+            invalid_session = True
+        elif row["expires_at"] <= now or row["last_seen_at"] <= now - timedelta(seconds=SESSION_IDLE_TIMEOUT_SECONDS):
+            conn.execute(
+                "UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE session_id = %s",
+                (row["session_id"],),
+            )
+            invalid_session = True
+        else:
+            if request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+                supplied_csrf = request.headers.get("X-CSRF-Token", "")
+                expected_csrf = csrf_token_for_session(raw_token)
+                csrf_invalid = not supplied_csrf or not compare_digest(supplied_csrf, expected_csrf)
+            # Avoid a write on every request while retaining a useful idle timeout.
+            if now - row["last_seen_at"] > timedelta(seconds=60):
+                conn.execute(
+                    "UPDATE user_sessions SET last_seen_at = NOW() WHERE session_id = %s AND revoked_at IS NULL",
+                    (row["session_id"],),
+                )
+            user = {
+                "user_id": row["user_id"],
+                "email": row["email"],
+                "role": row["role"],
+                "is_active": row["is_active"],
+                "created_at": row["created_at"],
+                "last_login_at": row["last_login_at"],
+                "session_id": row["session_id"],
+            }
+
+    if invalid_session:
+        cookie_header = expired_session_cookie_header()
+        api_error(
+            401,
+            "SESSION_INVALID",
+            "Your session is expired, revoked, or inactive. Log in again.",
+            headers={"Set-Cookie": cookie_header} if cookie_header else None,
+        )
+    if csrf_invalid:
+        api_error(403, "CSRF_VALIDATION_FAILED", "Missing or invalid X-CSRF-Token header.")
+    assert user is not None
+    return user
+
+
+def require_operator(user: dict[str, Any] = Depends(get_current_user)) -> str:
+    if user["role"] not in {"admin", "operator"}:
+        api_error(403, "INSUFFICIENT_PERMISSIONS", "An operator role is required.")
+    return user["email"]
+
+
+def require_admin(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    if user["role"] != "admin":
+        api_error(403, "INSUFFICIENT_PERMISSIONS", "An administrator role is required.")
+    return user
+
+
+def record_audit(
+    conn,
+    *,
+    actor_user_id: str | None,
+    actor_email: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """INSERT INTO audit_log
+           (actor_user_id, actor_email, action, target_type, target_id, metadata)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (actor_user_id, actor_email, action, target_type, target_id, Jsonb(metadata or {})),
+    )
 
 
 def is_number(value: Any) -> bool:
@@ -263,6 +494,57 @@ CREATE TABLE IF NOT EXISTS shipment_events (
     metadata JSONB NOT NULL DEFAULT '{}'::JSONB
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'operator')),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS user_invitations (
+    invitation_id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'operator')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('activate', 'password_reset')),
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    accepted_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    audit_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    actor_user_id TEXT REFERENCES users(user_id),
+    actor_email TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user_active
+    ON user_sessions (user_id, expires_at) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_user_invitations_email_status
+    ON user_invitations (email, expires_at) WHERE accepted_at IS NULL AND revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log (created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_telemetry_device_time ON telemetry (device_id, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telemetry_package_time ON telemetry (package_id, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telemetry_shipment_time ON telemetry (shipment_id, observed_at DESC);
@@ -273,11 +555,44 @@ CREATE INDEX IF NOT EXISTS idx_shipment_events_timeline ON shipment_events (ship
 """
 
 REQUIRED_COLUMNS = {
-    "devices": {"firmware_version", "hardware_model", "capabilities", "latest_observed_at", "latest_message", "config_version"},
-    "shipments": {"origin", "destination", "expected_delivery_at", "dispatched_at", "delivered_at"},
-    "packages": {"product_sku", "product_name", "quantity", "min_temperature_c", "max_temperature_c", "shock_threshold_g", "tracking_token_hash"},
-    "telemetry": {"boot_id", "message_seq", "config_version", "temperature_valid", "motion_valid", "peak_acceleration_magnitude_g", "raw_payload"},
-    "alerts": {"source_device_id", "source_boot_id", "source_message_seq", "severity", "details", "raw_payload", "resolved_at"},
+    "devices": {
+        "device_id", "firmware_version", "hardware_model", "capabilities", "registered_at",
+        "last_seen_at", "latest_observed_at", "latest_message", "last_boot_id",
+        "config_version", "config_applied_version",
+    },
+    "shipments": {
+        "shipment_id", "origin", "destination", "status", "expected_delivery_at",
+        "created_at", "updated_at", "dispatched_at", "delivered_at",
+    },
+    "packages": {
+        "package_id", "product_sku", "product_name", "quantity", "unit", "batch_number",
+        "expiry_date", "min_temperature_c", "max_temperature_c", "shock_threshold_g",
+        "device_id", "shipment_id", "status", "tracking_token_hash", "created_at",
+        "updated_at", "dispatched_at", "delivered_at",
+    },
+    "telemetry": {
+        "id", "device_id", "package_id", "shipment_id", "observed_at", "received_at",
+        "boot_id", "message_seq", "config_version", "temperature_valid", "temperature_c",
+        "motion_valid", "peak_acceleration_magnitude_g", "shock_count_since_last_report",
+        "location_fix_valid", "latitude", "longitude", "accuracy_m", "satellites_used", "raw_payload",
+    },
+    "alerts": {
+        "alert_id", "source_device_id", "source_boot_id", "source_message_seq", "package_id",
+        "shipment_id", "type", "severity", "status", "observed_at", "received_at", "details",
+        "raw_payload", "acknowledged_at", "acknowledged_by", "resolved_at", "resolved_by", "resolution_note",
+    },
+    "processed_messages": {"device_id", "boot_id", "message_seq", "processed_at"},
+    "shipment_events": {
+        "id", "shipment_id", "package_id", "event_type", "from_status", "to_status", "actor",
+        "occurred_at", "metadata",
+    },
+    "users": {"user_id", "email", "password_hash", "role", "is_active", "created_at", "updated_at", "last_login_at"},
+    "user_sessions": {"session_id", "user_id", "token_hash", "created_at", "last_seen_at", "expires_at", "revoked_at"},
+    "user_invitations": {
+        "invitation_id", "email", "role", "purpose", "token_hash", "created_by", "created_at",
+        "expires_at", "accepted_at", "revoked_at",
+    },
+    "audit_log": {"audit_id", "actor_user_id", "actor_email", "action", "target_type", "target_id", "metadata", "created_at"},
 }
 
 
@@ -329,6 +644,9 @@ def validate_envelope(data: Any, topic: str):
     missing = [key for key in required if key not in data]
     if missing:
         raise ValueError(f"Missing envelope fields: {', '.join(missing)}")
+    unknown = set(data) - set(required)
+    if unknown:
+        raise ValueError(f"Unknown envelope fields: {', '.join(sorted(unknown))}")
 
     if not isinstance(data["schema_version"], int) or isinstance(data["schema_version"], bool) or data["schema_version"] != 1:
         raise ValueError("schema_version must be integer 1")
@@ -346,6 +664,10 @@ def validate_envelope(data: Any, topic: str):
         value = data[name]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+    if data["message_seq"] > 9_223_372_036_854_775_807:
+        raise ValueError("message_seq exceeds PostgreSQL BIGINT range")
+    if data["config_version"] > 2_147_483_647:
+        raise ValueError("config_version exceeds PostgreSQL INTEGER range")
     if not isinstance(data["payload"], dict):
         raise ValueError("payload must be a JSON object")
     observed_at = parse_timestamp(data["observed_at"])
@@ -373,11 +695,20 @@ def validate_registration_payload(payload: dict) -> tuple[str | None, dict]:
 
 def parse_telemetry_payload(payload: dict) -> dict:
     """Validate the final nested telemetry format; the acceleration unit is g."""
+    allowed_payload = {"temperature", "motion", "location"}
+    if set(payload) != allowed_payload:
+        raise ValueError("telemetry payload must contain only temperature, motion and location objects")
     temperature = payload.get("temperature")
     motion = payload.get("motion")
     location = payload.get("location")
     if not isinstance(temperature, dict) or not isinstance(motion, dict) or not isinstance(location, dict):
         raise ValueError("telemetry requires temperature, motion and location objects")
+    if set(temperature) != {"valid", "celsius"}:
+        raise ValueError("temperature must contain only valid and celsius")
+    if set(motion) != {"valid", "peak_acceleration_magnitude_g", "shock_count_since_last_report"}:
+        raise ValueError("motion fields do not match the version-1 contract")
+    if set(location) != {"fix_valid", "latitude", "longitude", "accuracy_m", "satellites_used"}:
+        raise ValueError("location fields do not match the version-1 contract")
 
     if "valid" not in temperature or "celsius" not in temperature:
         raise ValueError("temperature requires valid and celsius fields")
@@ -405,8 +736,11 @@ def parse_telemetry_payload(payload: dict) -> dict:
     if not motion_valid and peak_g is not None:
         raise ValueError("Invalid motion must use peak_acceleration_magnitude_g=null")
     shock_count = motion.get("shock_count_since_last_report")
-    if not isinstance(shock_count, int) or isinstance(shock_count, bool) or shock_count < 0:
-        raise ValueError("motion.shock_count_since_last_report must be a non-negative integer")
+    if (
+        not isinstance(shock_count, int) or isinstance(shock_count, bool)
+        or shock_count < 0 or shock_count > 2_147_483_647
+    ):
+        raise ValueError("motion.shock_count_since_last_report must fit a non-negative PostgreSQL INTEGER")
 
     required_location = {"fix_valid", "latitude", "longitude", "accuracy_m", "satellites_used"}
     if not required_location.issubset(location):
@@ -418,8 +752,11 @@ def parse_telemetry_payload(payload: dict) -> dict:
     longitude = checked_number(location.get("longitude"), "location.longitude", -180, 180)
     accuracy = checked_number(location.get("accuracy_m"), "location.accuracy_m", 0, None)
     satellites = location.get("satellites_used")
-    if not isinstance(satellites, int) or isinstance(satellites, bool) or satellites < 0:
-        raise ValueError("location.satellites_used must be a non-negative integer")
+    if (
+        not isinstance(satellites, int) or isinstance(satellites, bool)
+        or satellites < 0 or satellites > 2_147_483_647
+    ):
+        raise ValueError("location.satellites_used must fit a non-negative PostgreSQL INTEGER")
     if fix_valid and (latitude is None or longitude is None):
         raise ValueError("A valid location fix requires latitude and longitude")
     if not fix_valid and any(value is not None for value in (latitude, longitude, accuracy)):
@@ -443,6 +780,13 @@ def validate_event_payload(payload: dict) -> tuple[str, dict]:
     event_type = payload.get("type")
     if event_type not in ALERT_TYPES:
         raise ValueError("event type must be temperature_breach or shock_detected")
+    if event_type == "temperature_breach":
+        allowed = {"type", "temperature_c", "breach_direction", "min_temperature_c", "max_temperature_c"}
+    else:
+        allowed = {"type", "peak_acceleration_magnitude_g", "threshold_g", "duration_ms"}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"Unknown {event_type} payload fields: {', '.join(sorted(unknown))}")
 
     if event_type == "temperature_breach":
         checked_number(payload.get("temperature_c"), "temperature_c", -100, 100, required=True)
@@ -485,6 +829,17 @@ def require_registered(conn, device_id: str) -> None:
     row = conn.execute("SELECT 1 FROM devices WHERE device_id = %s", (device_id,)).fetchone()
     if row is None:
         raise ValueError(f"Device {device_id} has not registered")
+
+
+def validate_reported_config_version(conn, envelope: dict) -> None:
+    row = conn.execute(
+        "SELECT config_version FROM devices WHERE device_id = %s",
+        (envelope["device_id"],),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Device {envelope['device_id']} has not registered")
+    if envelope["config_version"] > row["config_version"]:
+        raise ValueError("reported config_version is newer than the backend configuration")
 
 
 def bump_config_versions(conn, device_ids) -> list[str]:
@@ -607,41 +962,85 @@ def publish_device_config(client: mqtt.Client, device_id: str) -> None:
 def handle_registration(client: mqtt.Client, envelope: dict, observed_at: datetime, payload: dict) -> None:
     hardware_model, capabilities = validate_registration_payload(payload)
     device_id = envelope["device_id"]
+    duplicate_message = False
+    device_created = False
     with connect_db() as conn:
         existing = conn.execute(
-            "SELECT 1 FROM devices WHERE device_id = %s", (device_id,),
+            "SELECT config_version FROM devices WHERE device_id = %s FOR UPDATE", (device_id,),
         ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO devices (
-                device_id, firmware_version, hardware_model, capabilities,
-                last_seen_at, latest_observed_at, latest_message, last_boot_id,
-                config_applied_version
-            ) VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s)
-            ON CONFLICT (device_id) DO UPDATE SET
-                firmware_version = CASE WHEN EXCLUDED.latest_observed_at >= devices.latest_observed_at
-                    THEN EXCLUDED.firmware_version ELSE devices.firmware_version END,
-                hardware_model = EXCLUDED.hardware_model,
-                capabilities = EXCLUDED.capabilities,
-                last_seen_at = NOW(),
-                latest_observed_at = GREATEST(devices.latest_observed_at, EXCLUDED.latest_observed_at),
-                latest_message = CASE WHEN EXCLUDED.latest_observed_at >= devices.latest_observed_at
-                    THEN EXCLUDED.latest_message ELSE devices.latest_message END,
-                last_boot_id = CASE WHEN EXCLUDED.latest_observed_at >= devices.latest_observed_at
-                    THEN EXCLUDED.last_boot_id ELSE devices.last_boot_id END,
-                config_applied_version = CASE WHEN EXCLUDED.latest_observed_at >= devices.latest_observed_at
-                    THEN EXCLUDED.config_applied_version ELSE devices.config_applied_version END
-            """,
-            (
-                device_id, envelope["firmware_version"], hardware_model,
-                Jsonb(capabilities), observed_at, Jsonb(envelope), envelope["boot_id"],
-                envelope["config_version"],
-            ),
-        )
-    status = "already_registered" if existing else "registered"
-    logger.info("Device %s: %s", device_id, status)
+        if existing is None and envelope["config_version"] != 0:
+            raise ValueError("A new device must register with config_version 0")
+        if existing is not None and envelope["config_version"] > existing["config_version"]:
+            raise ValueError("reported config_version is newer than the backend configuration")
+
+        if existing is None:
+            # The processed_messages foreign key requires the device row to exist first.
+            # ON CONFLICT handles two simultaneous first registrations for the same ID.
+            device_insert = conn.execute(
+                """INSERT INTO devices (
+                    device_id, firmware_version, hardware_model, capabilities,
+                    last_seen_at, latest_observed_at, latest_message, last_boot_id,
+                    config_applied_version
+                ) VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s)
+                ON CONFLICT (device_id) DO NOTHING""",
+                (
+                    device_id, envelope["firmware_version"], hardware_model,
+                    Jsonb(capabilities), observed_at, Jsonb(envelope), envelope["boot_id"],
+                    envelope["config_version"],
+                ),
+            )
+            device_created = device_insert.rowcount == 1
+            # A concurrent registration may have created the row while this INSERT waited.
+            existing = conn.execute(
+                "SELECT config_version FROM devices WHERE device_id = %s FOR UPDATE", (device_id,),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("Device row disappeared during registration")
+            if envelope["config_version"] > existing["config_version"]:
+                raise ValueError("reported config_version is newer than the backend configuration")
+
+        inserted = conn.execute(
+            """INSERT INTO processed_messages (device_id, boot_id, message_seq)
+               VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING message_seq""",
+            (device_id, envelope["boot_id"], envelope["message_seq"]),
+        ).fetchone()
+        duplicate_message = inserted is None
+
+        if duplicate_message:
+            # Re-ACK on a QoS 1 redelivery so a tracker can recover a lost ACK,
+            # but do not refresh diagnostics or overwrite accepted data.
+            pass
+        else:
+            conn.execute(
+                """UPDATE devices SET
+                    firmware_version = CASE WHEN %s >= latest_observed_at THEN %s ELSE firmware_version END,
+                    hardware_model = CASE WHEN %s >= latest_observed_at THEN %s ELSE hardware_model END,
+                    capabilities = CASE WHEN %s >= latest_observed_at THEN %s ELSE capabilities END,
+                    last_seen_at = NOW(),
+                    latest_observed_at = GREATEST(latest_observed_at, %s),
+                    latest_message = CASE WHEN %s >= latest_observed_at THEN %s ELSE latest_message END,
+                    last_boot_id = CASE WHEN %s >= latest_observed_at THEN %s ELSE last_boot_id END,
+                    config_applied_version = CASE WHEN %s >= latest_observed_at THEN %s ELSE config_applied_version END
+                  WHERE device_id = %s""",
+                (
+                    observed_at, envelope["firmware_version"],
+                    observed_at, hardware_model,
+                    observed_at, Jsonb(capabilities),
+                    observed_at,
+                    observed_at, Jsonb(envelope),
+                    observed_at, envelope["boot_id"],
+                    observed_at, envelope["config_version"],
+                    device_id,
+                ),
+            )
+
+    status = "registered" if device_created and not duplicate_message else "already_registered"
+    if duplicate_message:
+        logger.info("Ignoring duplicate registration message %s/%s/%s", device_id, envelope["boot_id"], envelope["message_seq"])
+    else:
+        logger.info("Device %s: %s", device_id, status)
     publish_registration_ack(client, device_id, status)
-    # Always publish a config, including the unassigned config for a new tracker.
+    # Always publish current config so a reconnect can recover a lost config message.
     publish_device_config(client, device_id)
 
 
@@ -649,6 +1048,7 @@ def ingest_telemetry(envelope: dict, observed_at: datetime, values: dict) -> boo
     device_id = envelope["device_id"]
     with connect_db() as conn:
         require_registered(conn, device_id)
+        validate_reported_config_version(conn, envelope)
         inserted = conn.execute(
             """
             INSERT INTO processed_messages (device_id, boot_id, message_seq)
@@ -695,6 +1095,7 @@ def ingest_event(envelope: dict, observed_at: datetime, event_type: str, details
     device_id = envelope["device_id"]
     with connect_db() as conn:
         require_registered(conn, device_id)
+        validate_reported_config_version(conn, envelope)
         inserted = conn.execute(
             """
             INSERT INTO processed_messages (device_id, boot_id, message_seq)
@@ -957,8 +1358,51 @@ class PackageDeliver(StrictModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+class ShipmentDispatch(StrictModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class AlertResolve(StrictModel):
     resolution_note: str | None = Field(default=None, max_length=1000)
+
+
+class LoginRequest(StrictModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_login_email(cls, value):
+        return normalize_email(value)
+
+
+class InvitationCreate(StrictModel):
+    email: str = Field(min_length=3, max_length=254)
+    role: Literal["admin", "operator"] = "operator"
+
+    @field_validator("email")
+    @classmethod
+    def normalize_invitation_email(cls, value):
+        return normalize_email(value)
+
+
+class InvitationActivate(StrictModel):
+    token: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=128)
+
+
+class PasswordChange(StrictModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=128)
+
+
+class UserUpdate(StrictModel):
+    role: Literal["admin", "operator"] | None = None
+    is_active: bool | None = None
+
+
+class InvitationRevoke(StrictModel):
+    reason: str | None = Field(default=None, max_length=300)
 
 
 # ---------------------------------------------------------------------------
@@ -968,9 +1412,21 @@ class AlertResolve(StrictModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mqtt_client, mqtt_connected, mqtt_subscribed
-    ensure_schema()
-    mqtt_client = start_mqtt()
+    global mqtt_client, mqtt_connected, mqtt_subscribed, schema_ready
+    schema_ready = False
+    try:
+        ensure_schema()
+        schema_ready = True
+    except Exception:
+        # Keep the process alive for /health and let /readyz report 503.
+        # Do not consume MQTT messages until the schema is verified.
+        logger.exception("Database schema initialization failed; API is live but not ready")
+    if schema_ready:
+        try:
+            mqtt_client = start_mqtt()
+        except Exception:
+            mqtt_client = None
+            logger.exception("MQTT startup failed; API is live but not ready")
     try:
         yield
     finally:
@@ -980,10 +1436,160 @@ async def lifespan(app: FastAPI):
             mqtt_client = None
         mqtt_connected = False
         mqtt_subscribed = False
+        schema_ready = False
 
 
-app = FastAPI(title="ColdChain API", version="1.0.0", lifespan=lifespan)
-router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
+app = FastAPI(title="ColdChain API", version="1.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-CSRF-Token"],
+)
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(get_current_user)])
+
+
+@app.post("/api/v1/auth/login")
+def login(body: LoginRequest, request: Request, response: Response):
+    client_key = _login_attempt_key(request)
+    if login_rate_limited(client_key):
+        api_error(429, "LOGIN_RATE_LIMITED", "Too many failed login attempts. Try again later.")
+
+    with connect_db() as conn:
+        user = conn.execute(
+            "SELECT user_id, email, password_hash, role, is_active FROM users WHERE email = %s",
+            (body.email,),
+        ).fetchone()
+
+    # Verify against a valid dummy hash for unknown emails to reduce account enumeration timing.
+    # The hash is created lazily once, and is never stored or returned.
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        _DUMMY_PASSWORD_HASH = password_hasher.hash(secrets.token_urlsafe(32))
+    valid_password = verify_password(
+        user["password_hash"] if user else _DUMMY_PASSWORD_HASH,
+        body.password,
+    )
+    if user is None or not valid_password or not user["is_active"]:
+        record_login_failure(client_key)
+        api_error(401, "INVALID_CREDENTIALS", "Email or password is incorrect.")
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = session_token_hash(raw_token)
+    session_id = str(uuid.uuid4())
+    with connect_db() as conn:
+        conn.execute(
+            """INSERT INTO user_sessions (session_id, user_id, token_hash, expires_at)
+               VALUES (%s, %s, %s, NOW() + (%s * INTERVAL '1 second'))""",
+            (session_id, user["user_id"], token_hash, SESSION_TTL_SECONDS),
+        )
+        conn.execute("UPDATE users SET last_login_at = NOW() WHERE user_id = %s", (user["user_id"],))
+        record_audit(
+            conn, actor_user_id=user["user_id"], actor_email=user["email"],
+            action="login", target_type="user", target_id=user["user_id"], metadata={},
+        )
+    clear_login_failures(client_key)
+    set_session_cookie(response, raw_token)
+    return {
+        "user": {
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "role": user["role"],
+            "is_active": user["is_active"],
+        },
+        "csrf_token": csrf_token_for_session(raw_token),
+    }
+
+
+@app.post("/api/v1/auth/activate")
+def activate_invitation(body: InvitationActivate):
+    token_hash = session_token_hash(body.token)
+    # Cheap rejection before Argon2 work. The invitation is re-locked and revalidated
+    # in the transaction below to make single-use activation race-safe.
+    with connect_db() as conn:
+        candidate = conn.execute(
+            """SELECT expires_at, accepted_at, revoked_at
+               FROM user_invitations WHERE token_hash = %s""",
+            (token_hash,),
+        ).fetchone()
+    now = datetime.now(timezone.utc)
+    if (
+        candidate is None
+        or candidate["accepted_at"] is not None
+        or candidate["revoked_at"] is not None
+        or candidate["expires_at"] <= now
+    ):
+        api_error(400, "INVITATION_INVALID", "This invitation is invalid, expired, or already used.")
+
+    new_password_hash = hash_password(body.password)
+    with connect_db() as conn:
+        invitation = conn.execute(
+            """SELECT invitation_id, email, role, purpose, created_by, expires_at,
+                      accepted_at, revoked_at
+               FROM user_invitations WHERE token_hash = %s FOR UPDATE""",
+            (token_hash,),
+        ).fetchone()
+        now = datetime.now(timezone.utc)
+        if (
+            invitation is None
+            or invitation["accepted_at"] is not None
+            or invitation["revoked_at"] is not None
+            or invitation["expires_at"] <= now
+        ):
+            api_error(400, "INVITATION_INVALID", "This invitation is invalid, expired, or already used.")
+
+        if invitation["purpose"] == "activate":
+            existing = conn.execute("SELECT user_id FROM users WHERE email = %s", (invitation["email"],)).fetchone()
+            if existing is not None:
+                api_error(409, "ACCOUNT_ALREADY_EXISTS", "An account already exists for this email.")
+            user_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO users (user_id, email, password_hash, role) VALUES (%s, %s, %s, %s)",
+                (user_id, invitation["email"], new_password_hash, invitation["role"]),
+            )
+            conn.execute(
+                "UPDATE user_invitations SET accepted_at = NOW() WHERE invitation_id = %s",
+                (invitation["invitation_id"],),
+            )
+            record_audit(
+                conn, actor_user_id=user_id, actor_email=invitation["email"],
+                action="account_activated", target_type="user", target_id=user_id,
+                metadata={"role": invitation["role"]},
+            )
+            return {"status": "activated", "email": invitation["email"], "message": "Account activated. You can now log in."}
+
+        user = conn.execute(
+            "SELECT user_id, is_active FROM users WHERE email = %s FOR UPDATE",
+            (invitation["email"],),
+        ).fetchone()
+        if user is None:
+            api_error(404, "USER_NOT_FOUND", "The account for this reset invitation no longer exists.")
+        conn.execute(
+            "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s",
+            (new_password_hash, user["user_id"]),
+        )
+        conn.execute(
+            "UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE user_id = %s AND revoked_at IS NULL",
+            (user["user_id"],),
+        )
+        conn.execute(
+            "UPDATE user_invitations SET accepted_at = NOW() WHERE invitation_id = %s",
+            (invitation["invitation_id"],),
+        )
+        record_audit(
+            conn, actor_user_id=user["user_id"], actor_email=invitation["email"],
+            action="password_reset", target_type="user", target_id=user["user_id"], metadata={},
+        )
+    return {"status": "password_reset", "email": invitation["email"], "message": "Password reset. Log in with the new password."}
+
+
+@app.get("/activate", response_class=HTMLResponse)
+def activation_page():
+    """A minimal same-origin page for accepting admin-issued invitation links."""
+    html = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Activate ColdChain account</title><style>body{font:16px system-ui;max-width:480px;margin:3rem auto;padding:0 1rem;color:#222}label,input,button{display:block;width:100%;box-sizing:border-box;margin:.5rem 0 1rem}input,button{padding:.7rem}button{cursor:pointer}#status{white-space:pre-wrap}</style></head><body><h1>Activate account / reset password</h1><p>Choose a password with at least 12 characters.</p><form id="form"><label>New password<input id="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label><label>Confirm password<input id="confirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label><button type="submit">Continue</button></form><p id="status" role="status"></p><script>const statusNode=document.getElementById('status');const token=new URLSearchParams(location.hash.slice(1)).get('token')||'';if(location.hash)history.replaceState(null,'',location.pathname+location.search);document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();const password=document.getElementById('password').value;const confirm=document.getElementById('confirm').value;if(password!==confirm){statusNode.textContent='Passwords do not match.';return;}try{const r=await fetch('/api/v1/auth/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,password})});const data=await r.json();if(!r.ok)throw new Error(data.detail?.message||'Activation failed.');statusNode.textContent=data.message||'Success. You can now log in.';}catch(err){statusNode.textContent=err.message;}});</script></body></html>"""
+    return HTMLResponse(html, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
 
 
 def get_device_or_404(conn, device_id: str):
@@ -1021,6 +1627,7 @@ def fetch_package_detail(package_id: str):
                    lt.peak_acceleration_magnitude_g AS latest_peak_acceleration_magnitude_g,
                    lt.location_fix_valid AS latest_location_fix_valid,
                    lt.latitude AS latest_latitude, lt.longitude AS latest_longitude,
+                   lt.accuracy_m AS latest_accuracy_m, lt.satellites_used AS latest_satellites_used,
                    (SELECT COUNT(*)::INTEGER FROM alerts a
                     WHERE a.package_id = p.package_id AND a.status <> 'resolved') AS open_alert_count
             FROM packages p
@@ -1029,7 +1636,7 @@ def fetch_package_detail(package_id: str):
             LEFT JOIN LATERAL (
                 SELECT observed_at, received_at, temperature_valid, temperature_c,
                        motion_valid, peak_acceleration_magnitude_g,
-                       location_fix_valid, latitude, longitude
+                       location_fix_valid, latitude, longitude, accuracy_m, satellites_used
                 FROM telemetry t WHERE t.package_id = p.package_id
                 ORDER BY observed_at DESC, id DESC LIMIT 1
             ) lt ON TRUE
@@ -1076,6 +1683,8 @@ def fetch_package_detail(package_id: str):
             "location_fix_valid": data["latest_location_fix_valid"],
             "latitude": data["latest_latitude"],
             "longitude": data["latest_longitude"],
+            "accuracy_m": data["latest_accuracy_m"],
+            "satellites_used": data["latest_satellites_used"],
         }
     reserved = {
         "firmware_version", "last_seen_at", "config_version", "config_applied_version",
@@ -1084,6 +1693,7 @@ def fetch_package_detail(package_id: str):
         "latest_observed_at", "latest_received_at", "latest_temperature_valid",
         "latest_temperature_c", "latest_motion_valid", "latest_peak_acceleration_magnitude_g",
         "latest_location_fix_valid", "latest_latitude", "latest_longitude",
+        "latest_accuracy_m", "latest_satellites_used",
     }
     package = {key: value for key, value in data.items() if key not in reserved and key != "open_alert_count"}
     return {
@@ -1125,8 +1735,12 @@ def fetch_shipment_detail(shipment_id: str):
             (shipment_id,),
         ).fetchall()
         open_alert_count = conn.execute(
-            "SELECT COUNT(*)::INTEGER AS count FROM alerts "
-            "WHERE shipment_id = %s AND status <> 'resolved'",
+            """
+            SELECT COUNT(DISTINCT a.alert_id)::INTEGER AS count
+            FROM alerts a
+            JOIN packages p ON p.package_id = a.package_id
+            WHERE p.shipment_id = %s AND a.status <> 'resolved'
+            """,
             (shipment_id,),
         ).fetchone()["count"]
     packages = []
@@ -1207,18 +1821,20 @@ def health():
 
 @app.get("/readyz")
 def readyz():
-    db_ready = False
+    global_db_ready = False
     try:
         with connect_db() as conn:
-            conn.execute("SELECT 1")
-        db_ready = True
+            conn.execute("SELECT 1").fetchone()
+        global_db_ready = True
     except Exception:
         logger.exception("Readiness check: PostgreSQL unavailable")
-    mqtt_ready = mqtt_connected and mqtt_subscribed
-    status = "ok" if db_ready and mqtt_ready else "not_ready"
+    database_ready = global_db_ready and schema_ready
+    mqtt_ready = schema_ready and mqtt_connected and mqtt_subscribed
+    status = "ok" if database_ready and mqtt_ready else "not_ready"
     body = {
         "status": status,
-        "postgresql": "ready" if db_ready else "not_ready",
+        "postgresql": "ready" if database_ready else "not_ready",
+        "schema": "ready" if schema_ready else "not_ready",
         "mqtt_consumer": "ready" if mqtt_ready else "not_ready",
     }
     return JSONResponse(status_code=200 if status == "ok" else 503, content=body)
@@ -1230,7 +1846,7 @@ def readyz():
 
 
 @router.post("/packages", status_code=201)
-def create_package(body: PackageCreate, actor: str = Depends(require_admin)):
+def create_package(body: PackageCreate, actor: str = Depends(require_operator)):
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     year = datetime.now(timezone.utc).year
@@ -1330,7 +1946,7 @@ def get_package(package_id: str):
 
 
 @router.patch("/packages/{package_id}")
-def update_package(package_id: str, body: PackageUpdate):
+def update_package(package_id: str, body: PackageUpdate, actor: str = Depends(require_operator)):
     changes = body.model_dump(exclude_unset=True)
     if not changes:
         api_error(400, "NO_FIELDS_SUPPLIED", "Supply at least one package field to update.")
@@ -1387,6 +2003,32 @@ def update_package(package_id: str, body: PackageUpdate):
     return row
 
 
+@router.post("/packages/{package_id}/tracking-token/rotate")
+def rotate_tracking_token(package_id: str, admin: dict[str, Any] = Depends(require_admin)):
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    with connect_db() as conn:
+        package = conn.execute(
+            "SELECT package_id FROM packages WHERE package_id = %s FOR UPDATE",
+            (package_id,),
+        ).fetchone()
+        if package is None:
+            api_error(404, "PACKAGE_NOT_FOUND", "Package not found.")
+        conn.execute(
+            "UPDATE packages SET tracking_token_hash = %s, updated_at = NOW() WHERE package_id = %s",
+            (token_hash, package_id),
+        )
+        record_audit(
+            conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
+            action="tracking_token_rotated", target_type="package", target_id=package_id,
+            metadata={},
+        )
+    return {
+        "package_id": package_id,
+        "tracking_url": f"{PUBLIC_BASE_URL}/track/{quote(raw_token, safe='')}",
+    }
+
+
 @router.get("/packages/{package_id}/telemetry")
 def package_telemetry(
     package_id: str,
@@ -1422,7 +2064,7 @@ def package_telemetry(
 
 
 @router.post("/packages/{package_id}/deliver")
-def deliver_package(package_id: str, body: PackageDeliver | None = None, actor: str = Depends(require_admin)):
+def deliver_package(package_id: str, body: PackageDeliver | None = None, actor: str = Depends(require_operator)):
     body = body or PackageDeliver()
     device_ids: list[str] = []
     already_delivered = False
@@ -1515,7 +2157,7 @@ def deliver_package(package_id: str, body: PackageDeliver | None = None, actor: 
 
 
 @router.post("/shipments", status_code=201)
-def create_shipment(body: ShipmentCreate, actor: str = Depends(require_admin)):
+def create_shipment(body: ShipmentCreate, actor: str = Depends(require_operator)):
     year = datetime.now(timezone.utc).year
     device_ids: list[str] = []
     with connect_db() as conn:
@@ -1575,7 +2217,7 @@ def list_shipments(
                    COUNT(DISTINCT p.package_id) FILTER (WHERE p.status = 'delivered')::INTEGER AS delivered_package_count,
                    COUNT(DISTINCT a.alert_id) FILTER (WHERE a.status <> 'resolved')::INTEGER AS open_alert_count
             FROM shipments s LEFT JOIN packages p ON p.shipment_id = s.shipment_id
-            LEFT JOIN alerts a ON a.shipment_id = s.shipment_id
+            LEFT JOIN alerts a ON a.package_id = p.package_id
             {where}
             GROUP BY s.shipment_id
             ORDER BY s.created_at DESC LIMIT %s OFFSET %s
@@ -1591,7 +2233,7 @@ def get_shipment(shipment_id: str):
 
 
 @router.patch("/shipments/{shipment_id}")
-def update_shipment(shipment_id: str, body: ShipmentUpdate):
+def update_shipment(shipment_id: str, body: ShipmentUpdate, actor: str = Depends(require_operator)):
     changes = body.model_dump(exclude_unset=True)
     if not changes:
         api_error(400, "NO_FIELDS_SUPPLIED", "Supply origin, destination or expected_delivery_at.")
@@ -1615,7 +2257,12 @@ def update_shipment(shipment_id: str, body: ShipmentUpdate):
 
 
 @router.post("/shipments/{shipment_id}/dispatch")
-def dispatch_shipment(shipment_id: str, actor: str = Depends(require_admin)):
+def dispatch_shipment(
+    shipment_id: str,
+    body: ShipmentDispatch | None = None,
+    actor: str = Depends(require_operator),
+):
+    body = body or ShipmentDispatch()
     device_ids: list[str] = []
     already_dispatched = False
     with connect_db() as conn:
@@ -1634,7 +2281,8 @@ def dispatch_shipment(shipment_id: str, actor: str = Depends(require_admin)):
             packages = conn.execute(
                 """
                 SELECT p.package_id, p.status, p.device_id, p.min_temperature_c,
-                       p.max_temperature_c, p.shock_threshold_g, d.device_id AS registered_device
+                       p.max_temperature_c, p.shock_threshold_g, d.device_id AS registered_device,
+                       d.config_version, d.config_applied_version
                 FROM packages p LEFT JOIN devices d ON d.device_id = p.device_id
                 WHERE p.shipment_id = %s FOR UPDATE OF p
                 """,
@@ -1655,6 +2303,8 @@ def dispatch_shipment(shipment_id: str, actor: str = Depends(require_admin)):
                     or package["shock_threshold_g"] <= 0
                 ):
                     api_error(409, "PACKAGE_CONFIGURATION_INVALID", f"Package {package['package_id']} does not have valid monitoring thresholds.")
+                if package["config_applied_version"] < package["config_version"]:
+                    api_error(409, "TRACKER_CONFIG_NOT_APPLIED", f"Tracker for package {package['package_id']} has not reported that it applied the latest configuration.")
             conn.execute(
                 "UPDATE shipments SET status = 'in_transit', dispatched_at = NOW(), updated_at = NOW() "
                 "WHERE shipment_id = %s",
@@ -1665,9 +2315,10 @@ def dispatch_shipment(shipment_id: str, actor: str = Depends(require_admin)):
                 "WHERE shipment_id = %s",
                 (shipment_id,),
             )
+            dispatch_metadata = {"note": body.note.strip()} if body.note and body.note.strip() else {}
             insert_shipment_event(
                 conn, shipment_id, "shipment_dispatched", actor,
-                from_status="packed", to_status="in_transit", metadata={},
+                from_status="packed", to_status="in_transit", metadata=dispatch_metadata,
             )
             assigned = conn.execute(
                 "SELECT device_id FROM packages WHERE shipment_id = %s AND device_id IS NOT NULL",
@@ -1840,7 +2491,7 @@ def get_alert(alert_id: str):
 
 
 @router.post("/alerts/{alert_id}/acknowledge")
-def acknowledge_alert(alert_id: str, actor: str = Depends(require_admin)):
+def acknowledge_alert(alert_id: str, actor: str = Depends(require_operator)):
     with connect_db() as conn:
         row = conn.execute(
             """
@@ -1866,12 +2517,14 @@ def acknowledge_alert(alert_id: str, actor: str = Depends(require_admin)):
             ).fetchone()
             if row is None:
                 api_error(404, "ALERT_NOT_FOUND", "Alert not found.")
+            if row["status"] == "resolved":
+                api_error(409, "ALERT_ALREADY_RESOLVED", "A resolved alert cannot be acknowledged.")
             # Idempotent: repeat acknowledgements preserve the first actor/time.
     return row
 
 
 @router.post("/alerts/{alert_id}/resolve")
-def resolve_alert(alert_id: str, body: AlertResolve | None = None, actor: str = Depends(require_admin)):
+def resolve_alert(alert_id: str, body: AlertResolve | None = None, actor: str = Depends(require_operator)):
     body = body or AlertResolve()
     with connect_db() as conn:
         row = conn.execute(
@@ -1939,12 +2592,322 @@ def inventory_summary():
 
 
 # ---------------------------------------------------------------------------
+# Authentication session endpoints and administrator-only user management
+# ---------------------------------------------------------------------------
+
+
+@router.post("/auth/logout")
+def logout(request: Request, response: Response, user: dict[str, Any] = Depends(get_current_user)):
+    raw_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if raw_token:
+        with connect_db() as conn:
+            conn.execute(
+                "UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE token_hash = %s",
+                (session_token_hash(raw_token),),
+            )
+            record_audit(
+                conn, actor_user_id=user["user_id"], actor_email=user["email"],
+                action="logout", target_type="user", target_id=user["user_id"], metadata={},
+            )
+    clear_session_cookie(response)
+    return {"status": "logged_out"}
+
+
+@router.get("/auth/me")
+def auth_me(request: Request, user: dict[str, Any] = Depends(get_current_user)):
+    raw_token = request.cookies.get(SESSION_COOKIE_NAME)
+    return {
+        "user": {
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "role": user["role"],
+            "is_active": user["is_active"],
+            "created_at": user["created_at"],
+            "last_login_at": user["last_login_at"],
+        },
+        "csrf_token": csrf_token_for_session(raw_token) if raw_token else None,
+    }
+
+
+@router.post("/auth/password/change")
+def change_password(
+    body: PasswordChange,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE user_id = %s AND is_active = TRUE",
+            (user["user_id"],),
+        ).fetchone()
+        if row is None or not verify_password(row["password_hash"], body.current_password):
+            api_error(400, "CURRENT_PASSWORD_INVALID", "Current password is incorrect.")
+        if body.current_password == body.new_password:
+            api_error(422, "PASSWORD_UNCHANGED", "New password must differ from the current password.")
+        conn.execute(
+            "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s",
+            (hash_password(body.new_password), user["user_id"]),
+        )
+        conn.execute(
+            "UPDATE user_sessions SET revoked_at = NOW() WHERE user_id = %s AND revoked_at IS NULL AND session_id <> %s",
+            (user["user_id"], user["session_id"]),
+        )
+        record_audit(
+            conn, actor_user_id=user["user_id"], actor_email=user["email"],
+            action="password_changed", target_type="user", target_id=user["user_id"], metadata={},
+        )
+    return {"status": "password_changed", "other_sessions_revoked": True}
+
+
+def create_user_invitation(conn, admin: dict[str, Any], email: str, role: str, purpose: str) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    raw_token = secrets.token_urlsafe(32)
+    invitation_id = str(uuid.uuid4())
+    # A newly issued link supersedes older outstanding activation/reset links for this email.
+    conn.execute(
+        "UPDATE user_invitations SET revoked_at = NOW() "
+        "WHERE email = %s AND accepted_at IS NULL AND revoked_at IS NULL",
+        (email,),
+    )
+    conn.execute(
+        """INSERT INTO user_invitations
+           (invitation_id, email, role, purpose, token_hash, created_by, expires_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+        (
+            invitation_id, email, role, purpose, session_token_hash(raw_token),
+            admin["user_id"], now + timedelta(hours=INVITATION_TTL_HOURS),
+        ),
+    )
+    record_audit(
+        conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
+        action="invitation_created", target_type="invitation", target_id=invitation_id,
+        metadata={"email": email, "role": role, "purpose": purpose},
+    )
+    return {
+        "invitation_id": invitation_id,
+        "email": email,
+        "role": role,
+        "purpose": purpose,
+        "expires_at": now + timedelta(hours=INVITATION_TTL_HOURS),
+        # This raw token is shown only in the creation/reset response; only its hash is stored.
+        # Put the token in the URL fragment: browsers do not send fragments in HTTP requests/logs.
+        "activation_url": f"{ACTIVATION_BASE_URL}#token={quote(raw_token, safe='')}",
+    }
+
+
+@router.get("/auth/users")
+def list_users(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    with connect_db() as conn:
+        total = conn.execute("SELECT COUNT(*)::INTEGER AS count FROM users").fetchone()["count"]
+        rows = conn.execute(
+            """SELECT u.user_id, u.email, u.role, u.is_active, u.created_at,
+                      u.updated_at, u.last_login_at,
+                      (COUNT(s.session_id) FILTER (
+                        WHERE s.revoked_at IS NULL AND s.expires_at > NOW()
+                          AND s.last_seen_at > NOW() - make_interval(secs => %s::double precision)
+                      ))::INTEGER AS active_session_count
+               FROM users u LEFT JOIN user_sessions s ON s.user_id = u.user_id
+               GROUP BY u.user_id
+               ORDER BY u.created_at ASC, u.email
+               LIMIT %s OFFSET %s""",
+            (SESSION_IDLE_TIMEOUT_SECONDS, limit, offset),
+        ).fetchall()
+    return {"items": rows, "limit": limit, "offset": offset, "total": total}
+
+
+@router.post("/auth/users/invitations", status_code=201)
+def invite_user(body: InvitationCreate, admin: dict[str, Any] = Depends(require_admin)):
+    with connect_db() as conn:
+        existing = conn.execute("SELECT user_id FROM users WHERE email = %s", (body.email,)).fetchone()
+        if existing:
+            api_error(409, "USER_ALREADY_EXISTS", "An account already exists for this email.")
+        invitation = create_user_invitation(conn, admin, body.email, body.role, "activate")
+    return invitation
+
+
+@router.get("/auth/users/invitations")
+def list_invitations(
+    status: Literal["pending", "accepted", "revoked", "expired"] | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    where = "TRUE"
+    params: list[Any] = []
+    if status == "pending":
+        where = "accepted_at IS NULL AND revoked_at IS NULL AND expires_at > NOW()"
+    elif status == "accepted":
+        where = "accepted_at IS NOT NULL"
+    elif status == "revoked":
+        where = "revoked_at IS NOT NULL"
+    elif status == "expired":
+        where = "accepted_at IS NULL AND revoked_at IS NULL AND expires_at <= NOW()"
+    with connect_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*)::INTEGER AS count FROM user_invitations WHERE {where}", params
+        ).fetchone()["count"]
+        rows = conn.execute(
+            f"""SELECT invitation_id, email, role, purpose, created_by, created_at,
+                       expires_at, accepted_at, revoked_at
+                FROM user_invitations WHERE {where}
+                ORDER BY created_at DESC LIMIT %s OFFSET %s""",
+            [*params, limit, offset],
+        ).fetchall()
+    return {"items": rows, "limit": limit, "offset": offset, "total": total}
+
+
+@router.delete("/auth/users/invitations/{invitation_id}")
+def revoke_invitation(
+    invitation_id: str,
+    body: InvitationRevoke | None = None,
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    body = body or InvitationRevoke()
+    with connect_db() as conn:
+        invitation = conn.execute(
+            "SELECT invitation_id, email, accepted_at, revoked_at FROM user_invitations WHERE invitation_id = %s FOR UPDATE",
+            (invitation_id,),
+        ).fetchone()
+        if invitation is None:
+            api_error(404, "INVITATION_NOT_FOUND", "Invitation not found.")
+        if invitation["accepted_at"] is not None:
+            api_error(409, "INVITATION_ALREADY_USED", "An accepted invitation cannot be revoked.")
+        conn.execute(
+            "UPDATE user_invitations SET revoked_at = COALESCE(revoked_at, NOW()) WHERE invitation_id = %s",
+            (invitation_id,),
+        )
+        record_audit(
+            conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
+            action="invitation_revoked", target_type="invitation", target_id=invitation_id,
+            metadata={"email": invitation["email"], "reason": (body.reason or "").strip()},
+        )
+    return {"invitation_id": invitation_id, "status": "revoked"}
+
+
+@router.post("/auth/users/{user_id}/password-reset-invitations", status_code=201)
+def create_password_reset_invitation(user_id: str, admin: dict[str, Any] = Depends(require_admin)):
+    with connect_db() as conn:
+        user = conn.execute(
+            "SELECT user_id, email, role FROM users WHERE user_id = %s FOR UPDATE", (user_id,),
+        ).fetchone()
+        if user is None:
+            api_error(404, "USER_NOT_FOUND", "User not found.")
+        invitation = create_user_invitation(conn, admin, user["email"], user["role"], "password_reset")
+    return invitation
+
+
+@router.patch("/auth/users/{user_id}")
+def update_user(
+    user_id: str,
+    body: UserUpdate,
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        api_error(400, "NO_FIELDS_SUPPLIED", "Supply role and/or is_active.")
+    if any(value is None for value in changes.values()):
+        api_error(422, "NULL_NOT_ALLOWED", "role and is_active cannot be null.")
+
+    with connect_db() as conn:
+        # Serialize privilege changes so two concurrent requests cannot demote the last admin.
+        conn.execute("LOCK TABLE users IN EXCLUSIVE MODE")
+        target = conn.execute(
+            "SELECT user_id, email, role, is_active FROM users WHERE user_id = %s FOR UPDATE",
+            (user_id,),
+        ).fetchone()
+        if target is None:
+            api_error(404, "USER_NOT_FOUND", "User not found.")
+        new_role = changes.get("role", target["role"])
+        new_active = changes.get("is_active", target["is_active"])
+        loses_admin = target["role"] == "admin" and (new_role != "admin" or not new_active)
+        if loses_admin:
+            other_admins = conn.execute(
+                "SELECT COUNT(*)::INTEGER AS count FROM users WHERE role = 'admin' AND is_active = TRUE AND user_id <> %s",
+                (user_id,),
+            ).fetchone()["count"]
+            if other_admins < 1:
+                api_error(409, "LAST_ADMIN_REQUIRED", "At least one active administrator must remain.")
+        sets = ", ".join(f"{key} = %s" for key in changes)
+        values = list(changes.values())
+        conn.execute(
+            f"UPDATE users SET {sets}, updated_at = NOW() WHERE user_id = %s",
+            [*values, user_id],
+        )
+        if not new_active:
+            conn.execute(
+                "UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE user_id = %s AND revoked_at IS NULL",
+                (user_id,),
+            )
+        if target["role"] != new_role:
+            record_audit(
+                conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
+                action="user_role_changed", target_type="user", target_id=user_id,
+                metadata={"from": target["role"], "to": new_role},
+            )
+        if target["is_active"] != new_active:
+            record_audit(
+                conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
+                action="user_activated" if new_active else "user_disabled",
+                target_type="user", target_id=user_id,
+                metadata={"email": target["email"]},
+            )
+        updated = conn.execute(
+            "SELECT user_id, email, role, is_active, created_at, updated_at, last_login_at FROM users WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return updated
+
+
+@router.post("/auth/users/{user_id}/revoke-sessions")
+def revoke_user_sessions(user_id: str, admin: dict[str, Any] = Depends(require_admin)):
+    with connect_db() as conn:
+        target = conn.execute("SELECT user_id, email FROM users WHERE user_id = %s", (user_id,)).fetchone()
+        if target is None:
+            api_error(404, "USER_NOT_FOUND", "User not found.")
+        rows = conn.execute(
+            "UPDATE user_sessions SET revoked_at = NOW() WHERE user_id = %s AND revoked_at IS NULL RETURNING session_id",
+            (user_id,),
+        ).fetchall()
+        record_audit(
+            conn, actor_user_id=admin["user_id"], actor_email=admin["email"],
+            action="sessions_revoked", target_type="user", target_id=user_id,
+            metadata={"revoked_count": len(rows)},
+        )
+    return {"user_id": user_id, "revoked_sessions": len(rows)}
+
+
+@router.get("/auth/audit-log")
+def list_audit_log(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    with connect_db() as conn:
+        total = conn.execute("SELECT COUNT(*)::INTEGER AS count FROM audit_log").fetchone()["count"]
+        rows = conn.execute(
+            """SELECT audit_id, actor_user_id, actor_email, action, target_type,
+                      target_id, metadata, created_at
+               FROM audit_log ORDER BY created_at DESC, audit_id DESC LIMIT %s OFFSET %s""",
+            (limit, offset),
+        ).fetchall()
+    return {"items": rows, "limit": limit, "offset": offset, "total": total}
+
+
+# ---------------------------------------------------------------------------
 # Public, read-only tracking
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/v1/public/tracking/{token}")
-def public_tracking(token: str):
+def public_tracking(token: str, response: Response):
+    # Tracking tokens are bearer capabilities. Do not cache responses or leak the
+    # token-bearing page URL through an HTTP Referer header.
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with connect_db() as conn:
         row = conn.execute(
@@ -2038,10 +3001,63 @@ function esc(s) { return String(s ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;'
 fetch('/api/v1/public/tracking/' + encodeURIComponent(token)).then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail?.message || d.detail || 'Tracking unavailable');
 root.innerHTML = '<h2>' + esc(d.package.product_name) + '</h2><p>Package: ' + esc(d.package.package_id) + '</p><p>Status: ' + esc(d.package.status) + '</p><p>Temperature: ' + (d.monitoring.temperature_valid ? esc(d.monitoring.temperature_c) + ' °C' : 'Unknown') + '</p><p>Condition: ' + esc(d.monitoring.condition) + '</p><h3>Timeline</h3><ul>' + d.timeline.map(e => '<li>' + esc(e.label) + ' — ' + esc(e.occurred_at) + '</li>').join('') + '</ul>';
 }).catch(e => { root.textContent = e.message; });
-</script></body></html>""")
+</script></body></html>""", headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 app.include_router(router)
 
 
+def create_initial_admin(email: str) -> None:
+    """Create the first administrator interactively; never accepts a password on argv."""
+    normalized_email = normalize_email(email)
+    ensure_schema()
+    with connect_db() as conn:
+        active_admin = conn.execute(
+            "SELECT user_id FROM users WHERE role = 'admin' AND is_active = TRUE LIMIT 1"
+        ).fetchone()
+        if active_admin is not None:
+            raise RuntimeError("An active administrator already exists; use the admin dashboard to manage accounts.")
+        exists = conn.execute("SELECT user_id FROM users WHERE email = %s", (normalized_email,)).fetchone()
+        if exists is not None:
+            raise RuntimeError("That email already belongs to an account. Use admin-managed invitations or recover the account deliberately.")
+
+    password = getpass.getpass("Initial admin password (minimum 12 characters): ")
+    confirmation = getpass.getpass("Confirm password: ")
+    if password != confirmation:
+        raise RuntimeError("Passwords do not match.")
+    password_hash = hash_password(password)
+    user_id = str(uuid.uuid4())
+    with connect_db() as conn:
+        # Re-check inside the creation transaction in case another bootstrap ran concurrently.
+        conn.execute("LOCK TABLE users IN EXCLUSIVE MODE")
+        active_admin = conn.execute(
+            "SELECT user_id FROM users WHERE role = 'admin' AND is_active = TRUE LIMIT 1"
+        ).fetchone()
+        if active_admin is not None:
+            raise RuntimeError("An active administrator was created concurrently; no account was added.")
+        conn.execute(
+            "INSERT INTO users (user_id, email, password_hash, role) VALUES (%s, %s, %s, 'admin')",
+            (user_id, normalized_email, password_hash),
+        )
+        record_audit(
+            conn, actor_user_id=user_id, actor_email=normalized_email,
+            action="initial_admin_bootstrapped", target_type="user", target_id=user_id,
+            metadata={},
+        )
+    print(f"Created initial administrator: {normalized_email}")
+    print("Start the API and log in with this account. Do not share this password.")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host=API_HOST, port=API_PORT)
+    parser = argparse.ArgumentParser(description="ColdChain API")
+    parser.add_argument("command", nargs="?", choices=["serve", "create-admin"], default="serve")
+    parser.add_argument("--email", help="Email for the initial administrator (create-admin only)")
+    args = parser.parse_args()
+    if args.command == "create-admin":
+        if not args.email:
+            parser.error("create-admin requires --email")
+        try:
+            create_initial_admin(args.email)
+        except Exception as exc:
+            raise SystemExit(f"Could not create initial administrator: {exc}") from exc
+    else:
+        uvicorn.run(app, host=API_HOST, port=API_PORT)
