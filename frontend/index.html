@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>ColdGuardian · Live monitoring</title>
+  <link rel="stylesheet" href="main.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js" defer></script>
+  <script src="script.js" defer></script>
+  <script src="operations.js" defer></script>
+  <script src="admin.js" defer></script>
+</head>
+<body>
+  <div id="loginScreen" class="login-screen" hidden>
+    <form id="loginForm" class="login-card" method="post" action="/">
+      <div class="brand-mark large" aria-hidden="true">CG</div>
+      <p class="eyebrow">COLD-CHAIN TELEMETRY</p>
+      <h1>Welcome back.</h1>
+      <p class="muted">Sign in to monitor your registered trackers.</p>
+      <label for="emailInput">Email</label>
+      <input id="emailInput" name="email" type="email" autocomplete="username" required value="admin@admin.admin">
+      <label for="passwordInput">Password</label>
+      <input id="passwordInput" name="password" type="password" autocomplete="current-password" required>
+      <button class="button primary full" type="submit">Sign in <span aria-hidden="true">→</span></button>
+      <p id="loginError" class="form-error" role="alert"></p>
+      <p class="tiny muted">Uses the backend's session cookie. Credentials are not stored by this page.</p>
+    </form>
+  </div>
+
+  <div id="app" class="app-shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#top" aria-label="ColdGuardian home">
+        <span class="brand-mark">CG</span>
+        <span><strong>ColdGuardian</strong><small>Asset telemetry</small></span>
+      </a>
+      <div class="side-label">WORKSPACE</div>
+      <a class="nav-item active" href="#overview" data-view="overview"><span class="nav-icon">◫</span> Overview</a>
+      <a class="nav-item" href="#packages" data-view="packages"><span class="nav-icon">▣</span> Packages</a>
+      <a class="nav-item" href="#shipments" data-view="shipments"><span class="nav-icon">⇢</span> Shipments</a>
+      <a class="nav-item" href="#devices" data-view="devices"><span class="nav-icon">⌁</span> Devices</a>
+      <a class="nav-item" href="#alerts-page" data-view="alerts"><span class="nav-icon">◉</span> Alerts <span id="navAlertCount" class="nav-count">0</span></a>
+      <a class="nav-item" href="#historyView" data-view="history"><span class="nav-icon">▤</span> Package history</a>
+      <div class="side-label admin-nav-label">ADMINISTRATION</div>
+      <a class="nav-item" href="#usersView" data-view="users" data-admin-only><span class="nav-icon">♙</span> Users</a>
+      <a class="nav-item" href="#accountView" data-view="account"><span class="nav-icon">⚙</span> Account</a>
+      <a class="nav-item" href="#auditView" data-view="audit" data-admin-only><span class="nav-icon">≡</span> Audit log</a>
+      <div class="sidebar-bottom">
+        <div class="broker-status"><span id="apiDot" class="dot"></span><div><strong id="apiStatusText">Checking API…</strong><small id="apiStatusDetail">Waiting for readiness response</small></div></div>
+        <button id="logoutButton" class="button ghost full" type="button">Sign out <span aria-hidden="true">↗</span></button>
+      </div>
+    </aside>
+
+    <main class="main-content" id="top">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LIVE OPERATIONS / <span id="currentDate">TODAY</span></p>
+          <h1 id="pageTitle">Monitoring overview</h1>
+          <p id="pageSubtitle" class="muted">Real readings from your ColdGuardian API.</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="select-wrap"><span>Tracker</span><select id="trackerSelect" aria-label="Select tracker"><option value="">Loading trackers…</option></select></label>
+          <button id="refreshButton" class="button secondary" type="button"><span class="refresh-symbol">↻</span> Refresh</button>
+          <div class="user-chip"><span id="userInitial" class="avatar">A</span><span><strong id="userEmail">Admin</strong><small id="userRole">Operator</small></span></div>
+        </div>
+      </header>
+
+      <div id="globalError" class="notice error-notice" role="status" hidden></div>
+      <div id="globalNotice" class="notice info-notice" role="status" hidden></div>
+
+      <div id="overviewView" class="page-view">
+      <section id="overview" class="summary-grid" aria-label="Inventory summary">
+        <article class="summary-card summary-yellow"><div class="summary-head"><span>Packages tracked</span><span class="summary-icon">▦</span></div><strong id="packagesTotal" class="summary-value">—</strong><div class="summary-foot"><span id="packagesTransit">— in transit</span><span class="mini-label">INVENTORY</span></div></article>
+        <article class="summary-card"><div class="summary-head"><span>Trackers online</span><span class="summary-icon green">⌁</span></div><strong id="devicesOnline" class="summary-value">—</strong><div class="summary-foot"><span id="devicesOffline">— offline</span><span class="mini-label">DEVICES</span></div></article>
+        <article class="summary-card"><div class="summary-head"><span>Packages with alerts</span><span class="summary-icon red">!</span></div><strong id="alertsOpen" class="summary-value">—</strong><div class="summary-foot"><span>Packages with unresolved alerts</span><span id="alertSummaryBadge" class="status-pill warn">ATTENTION</span></div></article>
+      </section>
+
+      <section class="section-title-row">
+        <div><p class="eyebrow">SELECTED TRACKER</p><h2 id="selectedDeviceTitle">Choose a tracker</h2></div>
+        <div class="device-state"><span id="deviceStateDot" class="dot neutral"></span><span id="deviceStateText">Waiting for device</span><span class="separator">·</span><span id="lastUpdate">No telemetry yet</span></div>
+      </section>
+
+      <section class="metrics-grid">
+        <article class="panel reading-panel temperature-panel">
+          <div class="panel-top"><div><p class="panel-kicker">COLD-CHAIN CONDITION</p><h3>Temperature</h3></div><span id="temperatureStatus" class="status-pill neutral">NO DATA</span></div>
+          <div class="big-reading"><span id="temperatureValue">—</span><span class="reading-unit">°C</span></div>
+          <div class="threshold-line"><span>Allowed range</span><strong id="temperatureLimits">—</strong></div>
+          <div class="range-track"><span id="temperatureRangeMarker" class="range-marker" hidden></span></div>
+          <p id="temperatureHint" class="micro-copy">Waiting for a valid temperature sample.</p>
+        </article>
+        <article class="panel reading-panel shock-panel">
+          <div class="panel-top"><div><p class="panel-kicker">MOVEMENT / IMPACT</p><h3>Peak acceleration</h3></div><span id="shockStatus" class="status-pill neutral">NO DATA</span></div>
+          <div class="big-reading"><span id="shockValue">—</span><span class="reading-unit">g</span></div>
+          <div class="threshold-line"><span>Shock threshold</span><strong id="shockLimit">—</strong></div>
+          <div class="threshold-bar"><span id="shockBarFill"></span></div>
+          <p id="shockHint" class="micro-copy">Waiting for a valid accelerometer sample.</p>
+        </article>
+        <article class="panel gps-panel">
+          <div class="panel-top"><div><p class="panel-kicker">POSITIONING</p><h3>GPS location</h3></div><span id="gpsStatus" class="status-pill neutral">NO FIX</span></div>
+          <div class="coordinates"><div><span>LATITUDE</span><strong id="latitude">—</strong></div><div><span>LONGITUDE</span><strong id="longitude">—</strong></div></div>
+          <a id="mapLink" class="map-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Open in OpenStreetMap <span aria-hidden="true">↗</span></a>
+          <div class="gps-footer"><span id="gpsMeta">A valid GPS fix has not been received.</span><span id="gpsSatellites"></span></div>
+        </article>
+      </section>
+
+      <section id="telemetry" class="charts-grid">
+        <article class="panel chart-panel"><div class="panel-top"><div><p class="panel-kicker">LAST 40 READINGS</p><h3>Temperature history</h3></div><span class="chart-unit">°C</span></div><div class="chart-wrap"><canvas id="temperatureChart" aria-label="Temperature history chart"></canvas><p id="temperatureChartFallback" class="chart-fallback" hidden>Chart.js didn't load. Check your internet connection and reload.</p></div></article>
+        <article class="panel chart-panel"><div class="panel-top"><div><p class="panel-kicker">LAST 40 READINGS</p><h3>Acceleration history</h3></div><span class="chart-unit">g</span></div><div class="chart-wrap"><canvas id="shockChart" aria-label="Acceleration history chart"></canvas></div></article>
+      </section>
+
+      <section class="details-grid">
+        <article class="panel package-panel">
+          <div class="panel-top"><div><p class="panel-kicker">ASSIGNMENT</p><h3>Package details</h3></div><span id="packageStatus" class="status-pill neutral">UNASSIGNED</span></div>
+          <div class="package-identity"><div class="package-icon">▣</div><div><strong id="packageId">No package assigned</strong><p id="packageProduct">This tracker is not currently linked to a package.</p></div></div>
+          <div class="detail-list"><div><span>Product SKU</span><strong id="productSku">—</strong></div><div><span>Shipment</span><strong id="shipmentId">—</strong></div><div><span>Configuration</span><strong id="configVersion">—</strong></div><div><span>Reporting interval</span><strong id="reportInterval">—</strong></div></div>
+          <div id="configSync" class="sync-box"><span class="sync-dot"></span><span>Waiting for device configuration status.</span></div>
+        </article>
+
+        <article id="alerts" class="panel alerts-panel">
+          <div class="panel-top"><div><p class="panel-kicker">DEVICE EVENTS</p><h3>Recent alerts</h3></div><span id="alertsListCount" class="count-chip">0 alerts</span></div>
+          <div id="alertsList" class="alerts-list"><div class="empty-state">Loading alert history…</div></div>
+          <button id="loadMoreAlerts" class="button text-button" type="button" hidden>Show more alerts <span aria-hidden="true">→</span></button>
+        </article>
+      </section>
+
+      <section class="panel telemetry-table-panel">
+        <div class="panel-top table-header"><div><p class="panel-kicker">RAW OBSERVATIONS</p><h3>Recent telemetry</h3></div><span class="muted small">Newest first · refreshed automatically</span></div>
+        <div class="table-scroll"><table><thead><tr><th>Observed at</th><th>Temperature</th><th>Peak accel.</th><th>Shock count</th><th>GPS</th><th>Config</th></tr></thead><tbody id="telemetryRows"><tr><td colspan="6" class="empty-cell">Waiting for telemetry…</td></tr></tbody></table></div>
+      </section>
+      </div>
+
+      <section id="packagesView" class="page-view" hidden>
+        <div class="section-title-row operations-title">
+          <div><p class="eyebrow">INVENTORY MANAGEMENT</p><h2>Packages</h2><p class="muted">Create packages, set monitoring thresholds, assign registered trackers, and manage tracking QR URLs.</p></div>
+          <button id="refreshPackagesButton" class="button secondary" type="button">↻ Refresh packages</button>
+        </div>
+        <div id="packageMessage" class="notice info-notice" hidden></div>
+        <section class="panel operations-panel">
+          <div class="panel-top"><div><p class="panel-kicker">NEW RECORD</p><h3>Create package</h3></div><span class="status-pill neutral">PACKED</span></div>
+          <form id="packageCreateForm" class="form-grid">
+            <label>Product SKU<input id="createSku" required maxlength="100" placeholder="MED-001"></label>
+            <label>Product name<input id="createProductName" required maxlength="200" placeholder="Temperature-sensitive medicine"></label>
+            <label>Quantity<input id="createQuantity" required type="number" min="1" max="1000000" step="1" value="1"></label>
+            <label>Unit<input id="createUnit" required maxlength="40" value="package"></label>
+            <label>Batch number<input id="createBatch" maxlength="100" placeholder="Optional"></label>
+            <label>Expiry date<input id="createExpiry" type="date"></label>
+            <label>Minimum temperature (°C)<input id="createMinTemp" required type="number" min="-100" max="100" step="0.1" value="2"></label>
+            <label>Maximum temperature (°C)<input id="createMaxTemp" required type="number" min="-100" max="100" step="0.1" value="8"></label>
+            <label>Shock threshold (g)<input id="createShock" required type="number" min="0.001" max="1000" step="any" value="4"></label>
+            <label>Assign tracker (optional)<select id="createDeviceId"><option value="">No tracker assigned</option></select><small>Only registered, unassigned trackers can be selected.</small></label>
+            <div class="form-actions"><button class="button primary" type="submit">Create package <span aria-hidden="true">→</span></button></div>
+          </form>
+        </section>
+
+        <section id="trackingPanel" class="panel operations-panel" hidden>
+          <div class="panel-top"><div><p class="panel-kicker">PUBLIC READ-ONLY LINK</p><h3 id="trackingPanelTitle">Package tracking</h3></div><button id="closeTrackingPanel" class="button ghost" type="button">Close</button></div>
+          <p class="muted">The URL contains a private bearer token. Anyone with this URL can see the sanitized public tracking page.</p>
+          <div class="tracking-url-row"><input id="trackingUrlInput" readonly aria-label="Tracking URL"><a id="openTrackingLink" class="button secondary" href="#" target="_blank" rel="noopener noreferrer">Open page ↗</a></div>
+          <div class="form-actions"><a id="downloadQrLink" class="button primary" href="#" target="_blank" rel="noopener noreferrer">Open / download QR PNG</a><button id="rotateTrackingToken" class="button secondary" type="button">Rotate URL + refresh tracker</button></div>
+          <p id="trackingPanelHint" class="micro-copy">The ESP32 receives the tracking URL in its retained MQTT configuration and generates its OLED QR locally.</p>
+        </section>
+
+        <section id="packageEditPanel" class="panel operations-panel" hidden>
+          <div class="panel-top"><div><p class="panel-kicker">EDIT PACKED PACKAGE</p><h3 id="packageEditTitle">Edit package</h3></div><button id="cancelPackageEdit" class="button ghost" type="button">Cancel</button></div>
+          <form id="packageEditForm" class="form-grid">
+            <input id="editPackageId" type="hidden">
+            <label>Product SKU<input id="editSku" required maxlength="100"></label>
+            <label>Product name<input id="editProductName" required maxlength="200"></label>
+            <label>Quantity<input id="editQuantity" required type="number" min="1" max="1000000" step="1"></label>
+            <label>Unit<input id="editUnit" required maxlength="40"></label>
+            <label>Batch number<input id="editBatch" maxlength="100"></label>
+            <label>Expiry date<input id="editExpiry" type="date"></label>
+            <label>Minimum temperature (°C)<input id="editMinTemp" required type="number" min="-100" max="100" step="0.1"></label>
+            <label>Maximum temperature (°C)<input id="editMaxTemp" required type="number" min="-100" max="100" step="0.1"></label>
+            <label>Shock threshold (g)<input id="editShock" required type="number" min="0.001" max="1000" step="any"></label>
+            <label>Assigned tracker<select id="editDeviceId"><option value="">No tracker assigned</option></select><small>Changing this publishes refreshed config to the old and new tracker.</small></label>
+            <div class="form-actions"><button class="button primary" type="submit">Save package changes</button></div>
+          </form>
+        </section>
+
+        <section class="panel operations-panel">
+          <div class="panel-top"><div><p class="panel-kicker">DATABASE RECORDS</p><h3>All packages</h3></div><span id="packageListCount" class="count-chip">Loading…</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Package</th><th>Product</th><th>Status</th><th>Tracker</th><th>Shipment</th><th>Latest temp</th><th>Alerts</th><th>Actions</th></tr></thead><tbody id="packagesRows"><tr><td colspan="8" class="empty-cell">Loading packages…</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section id="shipmentsView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">TRANSPORT LIFECYCLE</p><h2>Shipments</h2><p class="muted">Group packed packages, dispatch only after tracker configuration is applied, and confirm deliveries.</p></div><button id="refreshShipmentsButton" class="button secondary" type="button">↻ Refresh shipments</button></div>
+        <div id="shipmentMessage" class="notice info-notice" hidden></div>
+        <section class="panel operations-panel">
+          <div class="panel-top"><div><p class="panel-kicker">NEW SHIPMENT</p><h3>Create shipment</h3></div><span class="status-pill neutral">PACKED</span></div>
+          <form id="shipmentCreateForm" class="form-grid">
+            <label>Origin<input id="shipmentOrigin" required maxlength="200" placeholder="Pune Warehouse"></label>
+            <label>Destination<input id="shipmentDestination" required maxlength="200" placeholder="Kolhapur Hospital"></label>
+            <label>Expected delivery (optional)<input id="shipmentExpected" type="datetime-local"><small>Local time is converted to an ISO timestamp.</small></label>
+            <fieldset class="package-choice-field"><legend>Select available packed packages</legend><div id="shipmentPackageChoices" class="package-choices"><p class="muted">Loading available packages…</p></div></fieldset>
+            <div class="form-actions"><button class="button primary" type="submit">Create shipment</button></div>
+          </form>
+        </section>
+        <section id="shipmentEditPanel" class="panel operations-panel" hidden>
+          <div class="panel-top"><div><p class="panel-kicker">EDIT PACKED SHIPMENT</p><h3 id="shipmentEditTitle">Edit shipment</h3></div><button id="cancelShipmentEdit" class="button ghost" type="button">Cancel</button></div>
+          <form id="shipmentEditForm" class="form-grid">
+            <input id="editShipmentId" type="hidden">
+            <label>Origin<input id="editShipmentOrigin" required maxlength="200"></label>
+            <label>Destination<input id="editShipmentDestination" required maxlength="200"></label>
+            <label>Expected delivery<input id="editShipmentExpected" type="datetime-local"></label>
+            <div class="form-actions"><button class="button primary" type="submit">Save shipment changes</button></div>
+          </form>
+        </section>
+        <section id="shipmentDetailPanel" class="panel operations-panel" hidden>
+          <div class="panel-top"><div><p class="panel-kicker">SHIPMENT DETAIL</p><h3 id="shipmentDetailTitle">Shipment</h3></div><button id="closeShipmentDetail" class="button ghost" type="button">Close</button></div>
+          <div id="shipmentDetailSummary" class="detail-list"></div>
+          <h4 class="subheading">Packages in this shipment</h4>
+          <div class="table-scroll"><table><thead><tr><th>Package</th><th>Product</th><th>Tracker</th><th>Status</th><th>Latest temp</th><th>Alerts</th><th>Action</th></tr></thead><tbody id="shipmentPackageRows"></tbody></table></div>
+          <h4 class="subheading">Timeline</h4><div id="shipmentEvents" class="timeline-list"></div>
+        </section>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">LIFECYCLE OVERVIEW</p><h3>All shipments</h3></div><span id="shipmentListCount" class="count-chip">Loading…</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Shipment</th><th>Route</th><th>Status</th><th>Packages</th><th>Delivered</th><th>Open alerts</th><th>Expected delivery</th><th>Actions</th></tr></thead><tbody id="shipmentsRows"><tr><td colspan="8" class="empty-cell">Loading shipments…</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section id="devicesView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">REGISTERED HARDWARE</p><h2>Devices</h2><p class="muted">Devices register themselves through MQTT. Assignments and thresholds belong to packages.</p></div><button id="refreshDevicesButton" class="button secondary" type="button">↻ Refresh devices</button></div>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">MQTT REGISTRATION</p><h3>Registered trackers</h3></div><span id="deviceListCount" class="count-chip">Loading…</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Device ID</th><th>Status</th><th>Firmware</th><th>Package</th><th>Shipment</th><th>Config version</th><th>Last seen</th><th>Actions</th></tr></thead><tbody id="devicesRows"><tr><td colspan="8" class="empty-cell">Loading devices…</td></tr></tbody></table></div>
+        </section>
+        <section id="deviceDetailPanel" class="panel operations-panel" hidden><div class="panel-top"><div><p class="panel-kicker">DEVICE DIAGNOSTICS</p><h3 id="deviceDetailTitle">Device</h3></div><button id="closeDeviceDetail" class="button ghost" type="button">Close</button></div><pre id="deviceDetailJson" class="json-view"></pre></section>
+      </section>
+
+      <section id="alertsView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">EXCURSIONS & INCIDENTS</p><h2>Alerts</h2><p class="muted">Acknowledge an alert to indicate review; resolve it only after the incident has been handled.</p></div><button id="refreshAlertsButton" class="button secondary" type="button">↻ Refresh alerts</button></div>
+        <section class="panel operations-panel"><div class="filter-row">
+          <label>Status<select id="alertStatusFilter"><option value="">All statuses</option><option value="open">Open</option><option value="acknowledged">Acknowledged</option><option value="resolved">Resolved</option></select></label>
+          <label>Type<select id="alertTypeFilter"><option value="">All alert types</option><option value="temperature_breach">Temperature breach</option><option value="shock_detected">Shock detected</option></select></label>
+          <label>Device<select id="alertDeviceFilter"><option value="">All devices</option></select></label>
+          <label>Package<select id="alertPackageFilter"><option value="">All packages</option></select></label>
+          <label>Shipment<select id="alertShipmentFilter"><option value="">All shipments</option></select></label>
+        </div>
+          <div class="panel-top"><div><p class="panel-kicker">BACKEND ALERT RECORDS</p><h3>Alert queue</h3></div><span id="allAlertsCount" class="count-chip">Loading…</span></div>
+          <div id="allAlertsList" class="alerts-list"><div class="empty-state">Loading alerts…</div></div>
+        </section>
+        <section id="alertDetailPanel" class="panel operations-panel" hidden>
+          <div class="panel-top"><div><p class="panel-kicker">ALERT DETAIL</p><h3 id="alertDetailTitle">Alert</h3></div><button id="closeAlertDetail" class="button ghost" type="button">Close</button></div>
+          <div id="alertDetailSummary" class="detail-list"></div>
+          <h4 class="subheading">Validated event details</h4>
+          <pre id="alertDetailJson" class="json-view"></pre>
+        </section>
+      </section>
+
+      <section id="historyView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">PACKAGE TELEMETRY</p><h2>Package history</h2><p class="muted">Historical sensor records stored by the backend, newest first. Synthetic simulator values should be treated as demo data.</p></div></div>
+        <section class="panel operations-panel">
+          <div class="filter-row"><label>Package<select id="historyPackageSelect"><option value="">Select a package</option></select></label><button id="loadPackageHistory" class="button primary" type="button">Load history</button><button id="refreshPackageHistory" class="button secondary" type="button">↻ Refresh</button></div>
+          <div id="historyMessage" class="notice info-notice" hidden></div>
+          <div class="charts-grid history-charts"><article class="panel chart-panel"><div class="panel-top"><div><p class="panel-kicker">HISTORICAL DATA</p><h3>Temperature</h3></div><span class="chart-unit">°C</span></div><div class="chart-wrap"><canvas id="packageHistoryTemperatureChart"></canvas></div></article><article class="panel chart-panel"><div class="panel-top"><div><p class="panel-kicker">HISTORICAL DATA</p><h3>Peak acceleration</h3></div><span class="chart-unit">g</span></div><div class="chart-wrap"><canvas id="packageHistoryShockChart"></canvas></div></article></div>
+          <div class="panel-top"><div><p class="panel-kicker">STORED OBSERVATIONS</p><h3>Telemetry records</h3></div><span id="historyCount" class="count-chip">0 records</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Observed</th><th>Device</th><th>Temperature</th><th>Peak acceleration</th><th>Shock count</th><th>GPS</th><th>Config</th></tr></thead><tbody id="packageHistoryRows"><tr><td colspan="7" class="empty-cell">Select a package to load history.</td></tr></tbody></table></div>
+          <div class="form-actions"><button id="loadOlderHistory" class="button secondary" type="button" hidden>Load older records</button></div>
+        </section>
+      </section>
+
+      <section id="usersView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">ACCESS CONTROL</p><h2>User administration</h2><p class="muted">Invitations are single-use and expire. Share activation links only with the intended person.</p></div><button id="refreshUsersButton" class="button secondary" type="button">↻ Refresh users</button></div>
+        <div id="usersMessage" class="notice info-notice" hidden></div>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">NEW ACCOUNT</p><h3>Invite a user</h3></div><span class="status-pill neutral">ADMIN ONLY</span></div>
+          <form id="inviteUserForm" class="form-grid"><label>Email<input id="inviteUserEmail" type="email" required maxlength="254" placeholder="operator@example.com"></label><label>Role<select id="inviteUserRole"><option value="operator">Operator</option><option value="admin">Admin</option></select></label><div class="form-actions"><button class="button primary" type="submit">Create invitation</button></div></form>
+          <div id="invitationResult" class="invite-result" hidden><strong>Activation link (shown only at creation)</strong><input id="invitationUrl" readonly aria-label="Activation URL"><div class="form-actions"><button id="copyInvitationUrl" class="button secondary" type="button">Copy link</button><a id="openInvitationUrl" class="button primary" href="#" target="_blank" rel="noopener noreferrer">Open activation page</a></div></div>
+        </section>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">ACCOUNTS</p><h3>Users</h3></div><span id="usersCount" class="count-chip">Loading…</span></div><div class="table-scroll"><table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Active sessions</th><th>Created</th><th>Actions</th></tr></thead><tbody id="usersRows"><tr><td colspan="6" class="empty-cell">Loading users…</td></tr></tbody></table></div></section>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">INVITATION MANAGEMENT</p><h3>Invitations</h3></div><label>Status<select id="invitationStatusFilter"><option value="">All</option><option value="pending">Pending</option><option value="accepted">Accepted</option><option value="revoked">Revoked</option><option value="expired">Expired</option></select></label></div><span id="invitationsCount" class="count-chip">Loading…</span><div class="table-scroll"><table><thead><tr><th>Email</th><th>Role</th><th>Purpose</th><th>Status</th><th>Expires</th><th>Actions</th></tr></thead><tbody id="invitationsRows"><tr><td colspan="6" class="empty-cell">Loading invitations…</td></tr></tbody></table></div></section>
+      </section>
+
+      <section id="accountView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">PERSONAL SECURITY</p><h2>Account settings</h2><p class="muted">Change your own password. Your current session remains active; other sessions are revoked by the backend.</p></div></div>
+        <div id="accountMessage" class="notice info-notice" hidden></div>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">PASSWORD</p><h3>Change password</h3></div><span class="status-pill neutral">MINIMUM 12 CHARACTERS</span></div>
+          <form id="changePasswordForm" class="form-grid"><label>Current password<input id="currentPassword" type="password" required autocomplete="current-password"></label><label>New password<input id="newPassword" type="password" required minlength="12" maxlength="128" autocomplete="new-password"></label><label>Confirm new password<input id="confirmNewPassword" type="password" required minlength="12" maxlength="128" autocomplete="new-password"></label><div class="form-actions"><button class="button primary" type="submit">Change password</button></div></form>
+        </section>
+      </section>
+
+      <section id="auditView" class="page-view" hidden>
+        <div class="section-title-row operations-title"><div><p class="eyebrow">SECURITY & OPERATIONS</p><h2>Audit log</h2><p class="muted">Administrative and lifecycle actions recorded by the backend. Admin access required.</p></div><button id="refreshAuditButton" class="button secondary" type="button">↻ Refresh audit log</button></div>
+        <div id="auditMessage" class="notice info-notice" hidden></div>
+        <section class="panel operations-panel"><div class="panel-top"><div><p class="panel-kicker">RECENT ACTIVITY</p><h3>Audit events</h3></div><span id="auditCount" class="count-chip">Loading…</span></div><div class="table-scroll"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Target ID</th><th>Metadata</th></tr></thead><tbody id="auditRows"><tr><td colspan="6" class="empty-cell">Loading audit log…</td></tr></tbody></table></div><div class="form-actions"><button id="loadOlderAudit" class="button secondary" type="button">Load older events</button></div></section>
+      </section>
+
+      <footer class="page-footer"><span>ColdGuardian</span><span>API-backed telemetry · 5-second dashboard refresh</span><span id="footerApi">API: localhost:8000</span></footer>
+    </main>
+  </div>
+  <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

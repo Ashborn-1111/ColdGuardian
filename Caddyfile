@@ -1,0 +1,12 @@
+:8080 {
+	@backend path /api/* /track/* /activate* /health /readyz /openapi.json /docs* /redoc*
+
+	handle @backend {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle {
+		root * /mnt/d/ColdGuardian/frontend
+		file_server
+	}
+}
