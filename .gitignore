@@ -54,3 +54,8 @@ Thumbs.db
 node_modules/
 dist/
 
+
+# Local environment files and secrets
+.env
+.env.*
+!.env.example
